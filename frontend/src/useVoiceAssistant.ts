@@ -4,6 +4,7 @@ import { WS_BASE, HTTP_BASE } from "./config";
 import type { AdkEvent, ClientTextMessage } from "./types";
 import { createAudioEngine } from "./audio/audioEngine";
 import type { AudioEngine } from "./audio/types";
+import { getToken } from "./auth";
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected";
 
@@ -66,7 +67,7 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
       const existing = id ? prev.find((t) => t.id === id) : null;
       if (existing) {
         return prev.map((t) =>
-          t.id === id ? { ...t, text: existing.text + text, partial } : t
+          t.id === id ? { ...t, text: existing.text + text, partial } : t,
         );
       }
       const newId = nextId();
@@ -81,7 +82,7 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
       const existing = id ? prev.find((t) => t.id === id) : null;
       if (existing) {
         return prev.map((t) =>
-          t.id === id ? { ...t, text: existing.text + text, partial } : t
+          t.id === id ? { ...t, text: existing.text + text, partial } : t,
         );
       }
       const newId = nextId();
@@ -111,8 +112,8 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
             prev.map((t) =>
               t.id === currentAssistantBubbleId.current
                 ? { ...t, text: t.text + " …(interrupted)", partial: false }
-                : t
-            )
+                : t,
+            ),
           );
         }
         resetBubbles();
@@ -123,7 +124,7 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
       if (event.inputTranscription?.text) {
         appendUserText(
           event.inputTranscription.text,
-          !event.inputTranscription.finished
+          !event.inputTranscription.finished,
         );
       }
 
@@ -131,7 +132,7 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
       if (event.outputTranscription?.text) {
         appendAssistantText(
           event.outputTranscription.text,
-          !event.outputTranscription.finished
+          !event.outputTranscription.finished,
         );
       }
 
@@ -158,7 +159,7 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
         finalizeBubbles();
       }
     },
-    [appendAssistantText, appendUserText, finalizeBubbles, resetBubbles]
+    [appendAssistantText, appendUserText, finalizeBubbles, resetBubbles],
   );
 
   // ---- connection --------------------------------------------------------
@@ -172,11 +173,19 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
       await getAudioEngine();
 
       // Ask the backend for a fresh user/session id pair.
-      const res = await fetch(`${HTTP_BASE}/new-session`);
-      if (!res.ok) throw new Error(`backend /new-session failed: ${res.status}`);
+      const token = await getToken();
+      if (!token) throw new Error("Not authenticated");
+
+      const res = await fetch(`${HTTP_BASE}/new-session`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok)
+        throw new Error(`backend /new-session failed: ${res.status}`);
       const { user_id, session_id } = await res.json();
 
-      const ws = new WebSocket(`${WS_BASE}/ws/${user_id}/${session_id}`);
+      const ws = new WebSocket(
+        `${WS_BASE}/ws/${user_id}/${session_id}?token=${encodeURIComponent(token)}`,
+      );
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -258,7 +267,7 @@ export function useVoiceAssistant(): UseVoiceAssistantResult {
       // Show the user's text immediately in the transcript.
       appendUserText(text, false);
     },
-    [appendUserText]
+    [appendUserText],
   );
 
   // ---- cleanup on unmount ------------------------------------------------

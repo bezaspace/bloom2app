@@ -17,7 +17,13 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.adk.agents.run_config import RunConfig, StreamingMode
@@ -29,6 +35,9 @@ from google.genai import types
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 # pylint: disable=wrong-import-position
+from app.auth import get_current_user
+from app.auth import router as auth_router
+from app.database import get_user_by_token, init_db
 from app.voice_agent.agent import agent  # noqa: E402
 
 logging.basicConfig(
@@ -60,6 +69,13 @@ runner = Runner(
     session_service=session_service,
 )
 
+app.include_router(auth_router)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    await init_db()
+
 
 @app.get("/health")
 async def health() -> dict:
@@ -68,7 +84,7 @@ async def health() -> dict:
 
 
 @app.get("/new-session")
-async def new_session() -> dict:
+async def new_session(user: str = Depends(get_current_user)) -> dict:
     """Generate a fresh user_id / session_id pair for a new conversation."""
     return {
         "user_id": f"user-{uuid.uuid4().hex[:8]}",
@@ -84,9 +100,16 @@ async def websocket_endpoint(
     websocket: WebSocket,
     user_id: str,
     session_id: str,
+    token: str | None = None,
 ) -> None:
     """Bidirectional streaming endpoint backed by ADK run_live()."""
     logger.info("WebSocket connect: user_id=%s session_id=%s", user_id, session_id)
+
+    if not token or not await get_user_by_token(token):
+        await websocket.close(code=1008)
+        logger.warning("WebSocket rejected: missing or invalid token")
+        return
+
     await websocket.accept()
 
     # We use AUDIO response modality so the model speaks back. The

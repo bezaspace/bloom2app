@@ -25,5 +25,10 @@ uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Health check: `GET http://localhost:8000/health`
-New session:  `GET http://localhost:8000/new-session`
-WebSocket:    `ws://localhost:8000/ws/{user_id}/{session_id}`
+Register:     `POST http://localhost:8000/auth/register`  `{username, password}`
+Login:        `POST http://localhost:8000/auth/login`     `{username, password}`
+Logout:       `POST http://localhost:8000/auth/logout`    `Authorization: Bearer <token>`
+New session:  `GET  http://localhost:8000/new-session`    `Authorization: Bearer <token>`
+WebSocket:    `ws://localhost:8000/ws/{user_id}/{session_id}?token=<token>`
+
+`new-session` and the WebSocket require a bearer token from `/auth/login` or `/auth/register`.

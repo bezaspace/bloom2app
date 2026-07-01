@@ -144,12 +144,15 @@ bloom2app/
 │   ├── pyproject.toml
 │   └── app/
 │       ├── main.py             ← FastAPI + WebSocket + ADK run_live()
+│       ├── auth.py             ← auth routes & dependency (SQLite)
+│       ├── database.py         ← SQLite user/token store
 │       └── voice_agent/
 │           └── agent.py        ← ADK Agent definition (Bloom)
 └── frontend/
-    ├── App.tsx                 ← Voice assistant UI
+    ├── App.tsx                 ← Voice assistant UI + auth screen
     ├── app.json                ← Expo config (mic permission)
     └── src/
+        ├── auth.ts             ← login/register API + token storage
         ├── config.ts           ← backend host/port
         ├── types.ts            ← ADK event types
         ├── useVoiceAssistant.ts    ← WebSocket + audio orchestration hook
