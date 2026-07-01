@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -12,9 +13,16 @@ import {
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
+import * as DocumentPicker from "expo-document-picker";
 import { useVoiceAssistant } from "./src/useVoiceAssistant";
 import type { ConnectionStatus } from "./src/useVoiceAssistant";
 import { getToken, login, logout, register } from "./src/auth";
+import {
+  getOnboardingStatus,
+  uploadDocument,
+  SUPPORTED_DOC_TYPES,
+} from "./src/onboarding";
+import type { OnboardingStatus, WellnessPlan } from "./src/onboarding";
 
 const STATUS_COLORS: Record<ConnectionStatus, string> = {
   disconnected: "#ef4444",
@@ -52,6 +60,15 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
 
+  const isConnected = status === "connected";
+
+  // Onboarding state
+  const [onboardingStatus, setOnboardingStatus] =
+    useState<OnboardingStatus | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadMsg, setUploadMsg] = useState<string | null>(null);
+  const [showPlan, setShowPlan] = useState(false);
+
   useEffect(() => {
     getToken().then((token) => {
       setIsAuthenticated(!!token);
@@ -59,7 +76,63 @@ export default function App() {
     });
   }, []);
 
-  const isConnected = status === "connected";
+  // Fetch onboarding status when connected, and poll while not yet onboarded
+  // so the plan appears automatically after the agent finalizes onboarding.
+  const refreshOnboarding = useCallback(async () => {
+    try {
+      const status = await getOnboardingStatus();
+      setOnboardingStatus(status);
+    } catch (e) {
+      console.warn("Failed to fetch onboarding status:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isConnected) {
+      setOnboardingStatus(null);
+      return;
+    }
+    // Fetch immediately on connect.
+    void refreshOnboarding();
+    // Poll every 5 seconds while connected and not onboarded.
+    const interval = setInterval(() => {
+      void refreshOnboarding();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isConnected, refreshOnboarding]);
+
+  const handleUploadDoc = useCallback(async () => {
+    setUploadMsg(null);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: SUPPORTED_DOC_TYPES,
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return; // User cancelled the picker
+      }
+      setUploading(true);
+      const asset = result.assets[0];
+      const response = await uploadDocument({
+        uri: asset.uri,
+        name: asset.name,
+        mimeType: asset.mimeType,
+        file: asset.file,
+        base64: asset.base64,
+      });
+      if (response.status === "success") {
+        setUploadMsg(`Uploaded "${response.filename}" — processed successfully.`);
+        void refreshOnboarding();
+      } else {
+        setUploadMsg(response.message || "Upload failed.");
+      }
+    } catch (e) {
+      setUploadMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUploading(false);
+    }
+  }, [refreshOnboarding]);
 
   const handleMicPress = async () => {
     if (isListening) {
@@ -203,6 +276,50 @@ export default function App() {
             </View>
           </View>
 
+          {/* Onboarding banner + upload controls */}
+          {isConnected && onboardingStatus && !onboardingStatus.onboarded && (
+            <View style={styles.onboardingBanner}>
+              <Text style={styles.onboardingBannerTitle}>
+                Welcome! Bloom will guide your onboarding.
+              </Text>
+              <Text style={styles.onboardingBannerText}>
+                Tap the mic and talk to Bloom. After a few questions, you can
+                upload health documents (optional) to personalize your plan.
+              </Text>
+              <View style={styles.uploadRow}>
+                <Pressable
+                  style={[
+                    styles.uploadButton,
+                    uploading && styles.uploadButtonDisabled,
+                  ]}
+                  onPress={handleUploadDoc}
+                  disabled={uploading}
+                >
+                  {uploading ? (
+                    <ActivityIndicator color="#fff" size="small" />
+                  ) : (
+                    <Text style={styles.uploadButtonText}>
+                      📎 Upload Document
+                    </Text>
+                  )}
+                </Pressable>
+              </View>
+              {uploadMsg && (
+                <Text style={styles.uploadMsg}>{uploadMsg}</Text>
+              )}
+            </View>
+          )}
+
+          {/* Onboarded: show plan button */}
+          {isConnected && onboardingStatus && onboardingStatus.onboarded && (
+            <Pressable
+              style={styles.planButton}
+              onPress={() => setShowPlan(true)}
+            >
+              <Text style={styles.planButtonText}>📋 View My 90-Day Plan</Text>
+            </Pressable>
+          )}
+
           {/* Transcript */}
           <ScrollView
             ref={scrollRef}
@@ -301,9 +418,77 @@ export default function App() {
               </View>
             )}
           </View>
+
+          {/* My Plan modal */}
+          <Modal
+            visible={showPlan}
+            animationType="slide"
+            onRequestClose={() => setShowPlan(false)}
+          >
+            <SafeAreaView style={styles.container}>
+              <View style={styles.planModalHeader}>
+                <Text style={styles.planModalTitle}>My 90-Day Wellness Plan</Text>
+                <Pressable
+                  style={styles.planModalClose}
+                  onPress={() => setShowPlan(false)}
+                >
+                  <Text style={styles.planModalCloseText}>Close</Text>
+                </Pressable>
+              </View>
+              <ScrollView
+                style={styles.planModalBody}
+                contentContainerStyle={styles.planModalBodyContent}
+              >
+                {onboardingStatus?.plan ? (
+                  <PlanView plan={onboardingStatus.plan} />
+                ) : (
+                  <Text style={styles.emptyHint}>
+                    Your plan will appear here after onboarding.
+                  </Text>
+                )}
+                {onboardingStatus?.doc_summary &&
+                  onboardingStatus.doc_summary.free_text_summary && (
+                    <View style={styles.docSummarySection}>
+                      <Text style={styles.docSummaryTitle}>
+                        From your documents:
+                      </Text>
+                      <Text style={styles.docSummaryText}>
+                        {onboardingStatus.doc_summary.free_text_summary}
+                      </Text>
+                    </View>
+                  )}
+              </ScrollView>
+            </SafeAreaView>
+          </Modal>
         </KeyboardAvoidingView>
       </SafeAreaView>
     </SafeAreaProvider>
+  );
+}
+
+/** Renders the 90-day wellness plan with its phases. */
+function PlanView({ plan }: { plan: WellnessPlan }) {
+  return (
+    <View>
+      <Text style={styles.planSummary}>{plan.summary}</Text>
+      {plan.phases.map((phase, i) => (
+        <View key={i} style={styles.planPhase}>
+          <Text style={styles.planPhaseName}>{phase.name}</Text>
+          <Text style={styles.planPhaseFocus}>{phase.focus}</Text>
+          {phase.actions.map((action, j) => (
+            <Text key={j} style={styles.planPhaseAction}>
+              {"\u2022"} {action}
+            </Text>
+          ))}
+        </View>
+      ))}
+      {plan.weekly_rhythm && (
+        <View style={styles.planWeeklyRhythm}>
+          <Text style={styles.planPhaseName}>Weekly Rhythm</Text>
+          <Text style={styles.planPhaseFocus}>{plan.weekly_rhythm}</Text>
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -528,5 +713,153 @@ const styles = StyleSheet.create({
     color: "#94a3b8",
     fontSize: 12,
     fontWeight: "600",
+  },
+  // ---- Onboarding banner + upload ----
+  onboardingBanner: {
+    backgroundColor: "#1e293b",
+    marginHorizontal: 16,
+    marginTop: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderRadius: 14,
+  },
+  onboardingBannerTitle: {
+    color: "#f1f5f9",
+    fontSize: 15,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  onboardingBannerText: {
+    color: "#94a3b8",
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 12,
+  },
+  uploadRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  uploadButton: {
+    backgroundColor: "#6366f1",
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    alignItems: "center",
+    flex: 1,
+  },
+  uploadButtonDisabled: {
+    backgroundColor: "#475569",
+  },
+  uploadButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  uploadMsg: {
+    color: "#a5b4fc",
+    fontSize: 12,
+    marginTop: 8,
+  },
+  // ---- Plan button ----
+  planButton: {
+    backgroundColor: "#6366f1",
+    marginHorizontal: 16,
+    marginTop: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: "center",
+  },
+  planButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  // ---- Plan modal ----
+  planModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#1e293b",
+  },
+  planModalTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#f8fafc",
+  },
+  planModalClose: {
+    backgroundColor: "#1e293b",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  planModalCloseText: {
+    color: "#94a3b8",
+    fontWeight: "600",
+  },
+  planModalBody: {
+    flex: 1,
+    paddingHorizontal: 20,
+  },
+  planModalBodyContent: {
+    paddingVertical: 20,
+  },
+  planSummary: {
+    color: "#e2e8f0",
+    fontSize: 15,
+    lineHeight: 22,
+    marginBottom: 20,
+  },
+  planPhase: {
+    backgroundColor: "#1e293b",
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 12,
+  },
+  planPhaseName: {
+    color: "#a5b4fc",
+    fontSize: 16,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  planPhaseFocus: {
+    color: "#cbd5e1",
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+  planPhaseAction: {
+    color: "#94a3b8",
+    fontSize: 13,
+    lineHeight: 19,
+    marginLeft: 4,
+  },
+  planWeeklyRhythm: {
+    backgroundColor: "#1e293b",
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 12,
+  },
+  docSummarySection: {
+    marginTop: 16,
+    backgroundColor: "#1e293b",
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  docSummaryTitle: {
+    color: "#a5b4fc",
+    fontSize: 14,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  docSummaryText: {
+    color: "#cbd5e1",
+    fontSize: 13,
+    lineHeight: 19,
   },
 });

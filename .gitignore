@@ -6,6 +6,9 @@
 # Auth database
 auth.db
 
+# Uploaded health documents
+backend/uploads/
+
 # Python
 __pycache__/
 *.py[cod]

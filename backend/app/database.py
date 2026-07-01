@@ -6,6 +6,7 @@ are required. The async wrappers run blocking DB calls via asyncio.to_thread().
 
 import asyncio
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -48,6 +49,32 @@ def _init_db_sync() -> None:
                 token TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        # Onboarding profile + 90-day plan, persisted per user across sessions.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                username TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                doc_summary_json TEXT,
+                onboarded INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        # Metadata for uploaded health documents (the file bytes are stored on
+        # disk under backend/uploads/<username>/; this table tracks them).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_docs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL
             )
             """
         )
@@ -107,6 +134,83 @@ def _delete_token_sync(token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Onboarding profile + plan + document summary (per-user, persistent)
+# ---------------------------------------------------------------------------
+def _get_profile_sync(username: str) -> dict | None:
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT profile_json, plan_json, doc_summary_json, onboarded "
+            "FROM user_profiles WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if not row:
+        return None
+    profile_json, plan_json, doc_summary_json, onboarded = row
+    return {
+        "profile": json.loads(profile_json) if profile_json else None,
+        "plan": json.loads(plan_json) if plan_json else None,
+        "doc_summary": json.loads(doc_summary_json) if doc_summary_json else None,
+        "onboarded": bool(onboarded),
+    }
+
+
+def _save_profile_sync(
+    username: str,
+    profile_json: str,
+    plan_json: str,
+    doc_summary_json: str | None,
+    onboarded: bool,
+) -> None:
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_profiles
+                (username, profile_json, plan_json, doc_summary_json, onboarded, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                profile_json = excluded.profile_json,
+                plan_json = excluded.plan_json,
+                doc_summary_json = excluded.doc_summary_json,
+                onboarded = excluded.onboarded,
+                updated_at = excluded.updated_at
+            """,
+            (
+                username,
+                profile_json,
+                plan_json,
+                doc_summary_json,
+                1 if onboarded else 0,
+                _now(),
+            ),
+        )
+        conn.commit()
+
+
+def _add_doc_record_sync(username: str, filename: str, mime_type: str) -> int:
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO user_docs (username, filename, mime_type, uploaded_at) "
+            "VALUES (?, ?, ?, ?)",
+            (username, filename, mime_type, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def _list_docs_sync(username: str) -> list[dict]:
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, filename, mime_type, uploaded_at FROM user_docs "
+            "WHERE username = ? ORDER BY uploaded_at DESC",
+            (username,),
+        ).fetchall()
+    return [
+        {"id": r[0], "filename": r[1], "mime_type": r[2], "uploaded_at": r[3]}
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Async wrappers
 # ---------------------------------------------------------------------------
 async def init_db() -> None:
@@ -131,3 +235,32 @@ async def get_user_by_token(token: str) -> str | None:
 
 async def delete_token(token: str) -> None:
     await asyncio.to_thread(_delete_token_sync, token)
+
+
+async def get_profile(username: str) -> dict | None:
+    return await asyncio.to_thread(_get_profile_sync, username)
+
+
+async def save_profile(
+    username: str,
+    profile_json: str,
+    plan_json: str,
+    doc_summary_json: str | None,
+    onboarded: bool,
+) -> None:
+    await asyncio.to_thread(
+        _save_profile_sync,
+        username,
+        profile_json,
+        plan_json,
+        doc_summary_json,
+        onboarded,
+    )
+
+
+async def add_doc_record(username: str, filename: str, mime_type: str) -> int:
+    return await asyncio.to_thread(_add_doc_record_sync, username, filename, mime_type)
+
+
+async def list_docs(username: str) -> list[dict]:
+    return await asyncio.to_thread(_list_docs_sync, username)

@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from fastapi import (
     Depends,
     FastAPI,
+    File,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -37,7 +39,15 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # pylint: disable=wrong-import-position
 from app.auth import get_current_user
 from app.auth import router as auth_router
-from app.database import get_user_by_token, init_db
+from app.database import (
+    add_doc_record,
+    get_profile,
+    get_user_by_token,
+    init_db,
+    list_docs,
+    save_profile,
+)
+from app.document_processor import SUPPORTED_MIME_TYPES, process_document
 from app.voice_agent.agent import agent  # noqa: E402
 
 logging.basicConfig(
@@ -47,6 +57,9 @@ logging.basicConfig(
 logger = logging.getLogger("bloom2.backend")
 
 APP_NAME = "bloom2"
+
+# Directory for uploaded health documents (stored per user).
+UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 # ---------------------------------------------------------------------------
 # Application initialization (once at startup)
@@ -92,6 +105,86 @@ async def new_session(user: str = Depends(get_current_user)) -> dict:
     }
 
 
+@app.get("/onboarding-status")
+async def onboarding_status(user: str = Depends(get_current_user)) -> dict:
+    """Return the user's onboarding status, profile, plan, and uploaded docs."""
+    profile_data = await get_profile(user)
+    docs = await list_docs(user)
+    if not profile_data:
+        return {"onboarded": False, "profile": None, "plan": None, "documents": docs}
+    return {
+        "onboarded": profile_data["onboarded"],
+        "profile": profile_data["profile"],
+        "plan": profile_data["plan"],
+        "doc_summary": profile_data["doc_summary"],
+        "documents": docs,
+    }
+
+
+@app.post("/upload-doc")
+async def upload_doc(
+    user: str = Depends(get_current_user),
+    file: UploadFile = File(...),
+) -> dict:
+    """Upload a health document (PDF or image), process it with Gemini Flash-Lite,
+    and store the structured summary on the user's profile.
+
+    The extracted summary is merged into the user's profile so the live voice
+    agent can pick it up via the get_document_summary tool during onboarding.
+    """
+    mime_type = file.content_type or ""
+    if mime_type not in SUPPORTED_MIME_TYPES:
+        return {
+            "status": "error",
+            "message": f"Unsupported file type: {mime_type}. Supported: {sorted(SUPPORTED_MIME_TYPES)}",
+        }
+
+    data = await file.read()
+    if not data:
+        return {"status": "error", "message": "Empty file."}
+
+    # Save the file to disk for record-keeping.
+    user_dir = UPLOADS_DIR / user
+    user_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename or "upload").name
+    file_path = user_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
+    file_path.write_bytes(data)
+
+    # Record metadata in the database.
+    await add_doc_record(user, safe_name, mime_type)
+
+    # Process with Gemini Flash-Lite for structured extraction.
+    try:
+        summary = await process_document(data, mime_type)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Document processing failed for %s: %s", user, e, exc_info=True)
+        return {"status": "error", "message": f"Document processing failed: {e}"}
+
+    # Merge the summary into the user's profile (create a stub if none exists yet
+    # — onboarding may not be finalized yet, but we store the doc_summary so the
+    # agent can read it when finalizing).
+    existing = await get_profile(user)
+    profile_json = json.dumps(existing["profile"]) if existing and existing.get("profile") else "{}"
+    plan_json = json.dumps(existing["plan"]) if existing and existing.get("plan") else "{}"
+    doc_summary_json = json.dumps(summary)
+    onboarded = existing["onboarded"] if existing else False
+
+    await save_profile(
+        username=user,
+        profile_json=profile_json,
+        plan_json=plan_json,
+        doc_summary_json=doc_summary_json,
+        onboarded=onboarded,
+    )
+
+    logger.info("Document processed for %s: %s (%d bytes)", user, safe_name, len(data))
+    return {
+        "status": "success",
+        "filename": safe_name,
+        "summary": summary,
+    }
+
+
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
@@ -110,6 +203,9 @@ async def websocket_endpoint(
         logger.warning("WebSocket rejected: missing or invalid token")
         return
 
+    # Resolve the actual username from the token so onboarding tools can read it
+    # from the session state.
+    username = await get_user_by_token(token)
     await websocket.accept()
 
     # We use AUDIO response modality so the model speaks back. The
@@ -129,9 +225,15 @@ async def websocket_endpoint(
         app_name=APP_NAME, user_id=user_id, session_id=session_id
     )
     if not session:
-        await session_service.create_session(
-            app_name=APP_NAME, user_id=user_id, session_id=session_id
+        session = await session_service.create_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=session_id,
+            state={"username": username},
         )
+    else:
+        # Ensure the username is present in the existing session's state.
+        session.state["username"] = username
 
     live_request_queue = LiveRequestQueue()
 
