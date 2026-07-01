@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# ./sb — Start the Bloom2 backend (FastAPI + ADK + Gemini Live API)
+#
+# Usage:
+#   ./sb              Start the backend on port 8000
+#   ./sb 9000         Start the backend on a custom port
+#
+# Requires: uv installed and backend/.env configured with GOOGLE_API_KEY.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/backend"
+
+PORT="${1:-8000}"
+
+if [ ! -f .env ]; then
+  echo "ERROR: backend/.env not found. Copy .env.example to .env and add your Gemini API key."
+  exit 1
+fi
+
+if grep -q "YOUR_GEMINI_API_KEY_HERE" .env; then
+  echo "WARNING: backend/.env still has the placeholder API key."
+  echo "         Edit it and add your real key from https://aistudio.google.com/apikey"
+fi
+
+echo "Starting Bloom2 backend on port $PORT ..."
+exec uv run uvicorn app.main:app --reload --host 0.0.0.0 --port "$PORT"

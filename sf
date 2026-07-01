@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# ./sf — Start the Bloom2 frontend (Expo, web mode by default)
+#
+# Usage:
+#   ./sf              Start Expo in web mode (opens browser)
+#   ./sf web          Same as above — explicit web mode
+#   ./sf android      Start Expo and open Android emulator
+#   ./sf ios          Start Expo and open iOS simulator (macOS only)
+#
+# The backend (./sb) must be running before connecting in the app.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/frontend"
+
+PLATFORM="${1:-web}"
+
+case "$PLATFORM" in
+  web)
+    echo "Starting Bloom2 frontend in WEB mode ..."
+    echo "Make sure the backend is running: ./sb"
+    echo ""
+    exec npx expo start --web
+    ;;
+  android)
+    echo "Starting Bloom2 frontend for ANDROID ..."
+    echo "Make sure the backend is running: ./sb"
+    echo ""
+    exec npx expo start --android
+    ;;
+  ios)
+    echo "Starting Bloom2 frontend for iOS ..."
+    echo "Make sure the backend is running: ./sb"
+    echo ""
+    exec npx expo start --ios
+    ;;
+  *)
+    echo "Usage: ./sf [web|android|ios]"
+    echo "  web       Start in web mode (default) — opens browser"
+    echo "  android   Start and open Android emulator"
+    echo "  ios       Start and open iOS simulator"
+    exit 1
+    ;;
+esac
