@@ -40,12 +40,28 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 from app.auth import get_current_user
 from app.auth import router as auth_router
 from app.database import (
+    add_biomarkers,
     add_doc_record,
+    delete_daily_schedule,
+    get_daily_logs,
+    get_daily_schedule,
     get_profile,
+    get_recent_daily_logs,
     get_user_by_token,
     init_db,
+    list_biomarkers,
+    list_biomarkers_by_name,
     list_docs,
+    save_daily_log,
+    save_daily_schedule,
     save_profile,
+)
+from app.dashboard.biomarkers import extract_biomarkers
+from app.dashboard.generator import generate_daily_schedule
+from app.dashboard.schemas import (
+    DashboardToday,
+    DailyLogRequest,
+    WELLNESS_DOMAINS,
 )
 from app.document_processor import SUPPORTED_MIME_TYPES, process_document
 from app.voice_agent.agent import agent  # noqa: E402
@@ -160,6 +176,18 @@ async def upload_doc(
         logger.error("Document processing failed for %s: %s", user, e, exc_info=True)
         return {"status": "error", "message": f"Document processing failed: {e}"}
 
+    # Second pass: extract structured numeric biomarker readings (for the
+    # dashboard trend charts). Runs in parallel with nothing else but is
+    # best-effort — failures here don't fail the upload.
+    biomarker_count = 0
+    try:
+        readings = await extract_biomarkers(data, mime_type, safe_name)
+        if readings:
+            await add_biomarkers(user, readings)
+            biomarker_count = len(readings)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Biomarker extraction failed for %s: %s", user, e)
+
     # Merge the summary into the user's profile (create a stub if none exists yet
     # — onboarding may not be finalized yet, but we store the doc_summary so the
     # agent can read it when finalizing).
@@ -182,7 +210,231 @@ async def upload_doc(
         "status": "success",
         "filename": safe_name,
         "summary": summary,
+        "biomarkers_extracted": biomarker_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard endpoints
+# ---------------------------------------------------------------------------
+def _today_iso() -> str:
+    from datetime import date
+    return date.today().isoformat()
+
+
+@app.get("/dashboard/today")
+async def dashboard_today(user: str = Depends(get_current_user)) -> dict:
+    """Return everything the dashboard needs for today in one call:
+    onboarding status, plan summary, the AI-generated daily schedule (generated
+    on first request and cached), today's per-domain logs, and a biomarker
+    count.
+    """
+    profile_data = await get_profile(user)
+    onboarded = bool(profile_data and profile_data.get("onboarded"))
+    if not onboarded:
+        return DashboardToday(
+            date=_today_iso(),
+            onboarded=False,
+            day_of_plan=0,
+            phase="",
+        ).model_dump()
+
+    plan = profile_data.get("plan") or {}
+    profile = profile_data.get("profile") or {}
+    doc_summary = profile_data.get("doc_summary")
+    onboarded_at = profile_data.get("onboarded_at")
+
+    # Generate (or fetch cached) today's schedule.
+    iso_date = _today_iso()
+    schedule_dict = await get_daily_schedule(user, iso_date)
+    if not schedule_dict:
+        schedule = await generate_daily_schedule(
+            profile=profile,
+            plan=plan,
+            doc_summary=doc_summary,
+            onboarded_at=onboarded_at,
+            target_date=iso_date,
+        )
+        schedule_dict = schedule.model_dump()
+        await save_daily_schedule(user, iso_date, json.dumps(schedule_dict))
+
+    # Fetch today's logs (keyed by domain).
+    logs = await get_daily_logs(user, iso_date)
+
+    # Biomarker count for the header badge.
+    biomarkers = await list_biomarkers(user)
+
+    # Current phase focus for the plan summary card.
+    day_of_plan = schedule_dict.get("day_of_plan", 1)
+    phase = schedule_dict.get("phase", "")
+    phases = plan.get("phases", []) if plan else []
+    phase_focus = ""
+    if phases:
+        idx = min(len(phases) - 1, (day_of_plan - 1) // 30)
+        phase_focus = phases[idx].get("focus", "")
+
+    return DashboardToday(
+        date=iso_date,
+        onboarded=True,
+        day_of_plan=day_of_plan,
+        phase=phase,
+        plan_summary=plan.get("summary") if plan else None,
+        plan_phase_focus=phase_focus or None,
+        schedule=schedule_dict,
+        logs=logs,
+        biomarker_count=len(biomarkers),
+    ).model_dump()
+
+
+@app.post("/dashboard/schedule/regenerate")
+async def dashboard_regenerate_schedule(
+    user: str = Depends(get_current_user),
+) -> dict:
+    """Delete today's cached schedule and generate a fresh one."""
+    profile_data = await get_profile(user)
+    if not profile_data or not profile_data.get("onboarded"):
+        return {"status": "error", "message": "Not onboarded."}
+
+    iso_date = _today_iso()
+    await delete_daily_schedule(user, iso_date)
+
+    plan = profile_data.get("plan") or {}
+    profile = profile_data.get("profile") or {}
+    doc_summary = profile_data.get("doc_summary")
+    onboarded_at = profile_data.get("onboarded_at")
+
+    schedule = await generate_daily_schedule(
+        profile=profile,
+        plan=plan,
+        doc_summary=doc_summary,
+        onboarded_at=onboarded_at,
+        target_date=iso_date,
+    )
+    schedule_dict = schedule.model_dump()
+    await save_daily_schedule(user, iso_date, json.dumps(schedule_dict))
+    return {"status": "success", "schedule": schedule_dict}
+
+
+@app.post("/dashboard/log")
+async def dashboard_log(
+    body: DailyLogRequest,
+    user: str = Depends(get_current_user),
+) -> dict:
+    """Upsert a per-domain daily log (replaces prior entries for that domain
+    on that date)."""
+    if body.domain not in WELLNESS_DOMAINS:
+        return {
+            "status": "error",
+            "message": f"Invalid domain. Must be one of: {WELLNESS_DOMAINS}",
+        }
+    entries_json = json.dumps([e.model_dump() for e in body.entries])
+    await save_daily_log(user, body.date, body.domain, entries_json)
+    return {"status": "success"}
+
+
+@app.get("/dashboard/logs/recent")
+async def dashboard_recent_logs(
+    domain: str,
+    days: int = 7,
+    user: str = Depends(get_current_user),
+) -> dict:
+    """Return the last `days` days of logs for a single domain (for 7-day
+    bar charts). Days with no log row are omitted; the client fills gaps."""
+    if domain not in WELLNESS_DOMAINS:
+        return {
+            "status": "error",
+            "message": f"Invalid domain. Must be one of: {WELLNESS_DOMAINS}",
+        }
+    days = max(1, min(days, 90))
+    rows = await get_recent_daily_logs(user, domain, days)
+    return {"status": "success", "domain": domain, "days": days, "logs": rows}
+
+
+@app.get("/dashboard/biomarkers")
+async def dashboard_biomarkers(user: str = Depends(get_current_user)) -> dict:
+    """Return all biomarker readings for the user, grouped by marker name.
+
+    Each group contains the marker name, unit, reference/optimal ranges (from
+    the most recent reading that has them), and the full history of readings
+    (oldest first) for trend charts.
+    """
+    rows = await list_biomarkers(user)
+    groups: dict[str, dict] = {}
+    for r in rows:
+        g = groups.setdefault(
+            r["name"],
+            {
+                "name": r["name"],
+                "unit": r["unit"],
+                "ref_low": None,
+                "ref_high": None,
+                "optimal_low": None,
+                "optimal_high": None,
+                "readings": [],
+            },
+        )
+        # Prefer the most recent non-null ranges.
+        if g["ref_low"] is None and r["ref_low"] is not None:
+            g["ref_low"] = r["ref_low"]
+        if g["ref_high"] is None and r["ref_high"] is not None:
+            g["ref_high"] = r["ref_high"]
+        if g["optimal_low"] is None and r["optimal_low"] is not None:
+            g["optimal_low"] = r["optimal_low"]
+        if g["optimal_high"] is None and r["optimal_high"] is not None:
+            g["optimal_high"] = r["optimal_high"]
+        g["readings"].append(r)
+    # Reverse each group's readings to oldest-first for charting.
+    for g in groups.values():
+        g["readings"].reverse()
+    return {"status": "success", "groups": list(groups.values())}
+
+
+@app.get("/dashboard/biomarkers/{name}")
+async def dashboard_biomarker_detail(
+    name: str,
+    user: str = Depends(get_current_user),
+) -> dict:
+    """Return the full history for a single biomarker (oldest first)."""
+    rows = await list_biomarkers_by_name(user, name)
+    return {"status": "success", "name": name, "readings": rows}
+
+
+@app.post("/dashboard/biomarkers/refresh-from-docs")
+async def dashboard_refresh_biomarkers(
+    user: str = Depends(get_current_user),
+) -> dict:
+    """Re-run biomarker extraction over all of the user's uploaded lab
+    documents. Useful after the extraction prompt is improved, or if the
+    initial extraction failed."""
+    from pathlib import Path
+
+    docs = await list_docs(user)
+    user_dir = UPLOADS_DIR / user
+    total = 0
+    skipped = 0
+    for doc in docs:
+        # Find the file on disk (files are stored with a uuid prefix).
+        matches = list(user_dir.glob(f"*_{doc['filename']}"))
+        if not matches:
+            skipped += 1
+            continue
+        file_path = matches[0]
+        data = file_path.read_bytes()
+        try:
+            readings = await extract_biomarkers(
+                data, doc["mime_type"], doc["filename"]
+            )
+            if readings:
+                await add_biomarkers(user, readings)
+                total += len(readings)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Re-extraction failed for %s: %s", doc["filename"], e)
+    return {
+        "status": "success",
+        "extracted": total,
+        "skipped": skipped,
+    }
+
 
 
 # ---------------------------------------------------------------------------

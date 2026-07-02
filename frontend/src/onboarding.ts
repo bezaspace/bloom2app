@@ -72,6 +72,8 @@ export interface UploadDocResponse {
   filename?: string;
   summary?: DocumentSummary;
   message?: string;
+  /** Number of structured biomarker readings extracted (dashboard feature). */
+  biomarkers_extracted?: number;
 }
 
 /**
