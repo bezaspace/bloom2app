@@ -3,7 +3,7 @@
 High-level feature map of what's been built in Bloom2 so far.
 
 ## 1. Auth
-- Username/password login + register (SQLite, PBKDF2)
+- Username/password login + register (PostgreSQL via psycopg3 async, PBKDF2)
 - Bearer-token sessions; token stored client-side in AsyncStorage
 
 ## 2. Voice Assistant (Talk tab)
@@ -58,7 +58,7 @@ High-level feature map of what's been built in Bloom2 so far.
   - **AI chat** — per-patient text chat grounded in that patient's live data (stateless per question).
   - **Settings** — edit practitioner profile (name, title, specialization, bio, contact, fee).
 - **Backend extensions:**
-  - `practitioner_db.py` — SQLite store for practitioners, practitioner_tokens, appointments, practitioner_patient_connections, practitioner_notes.
+  - `practitioner_db.py` — PostgreSQL store for practitioners, practitioner_tokens, appointments, practitioner_patient_connections, practitioner_notes.
   - `practitioner_auth.py` — practitioner auth routes + `get_current_practitioner` dependency (separate from patient auth).
   - `practitioner_routes.py` — practitioner-facing endpoints (appointments management, connected patients, patient detail data access with connection check, notes, AI summary/chat).
   - `patient_practitioner_routes.py` — patient-facing endpoints (browse practitioners, book appointment, my appointments, cancel).
@@ -88,7 +88,8 @@ patient see how daily behaviors move long-term outcomes.
 - **`plan_suggestions`** — AI-proposed plan adjustments for practitioner review.
 - **`metric_templates`** — 25+ pre-built metric templates across categories
   (activity, sleep, nutrition, mental health, vitals, medication, symptoms).
-- Migration runs automatically on startup (`run_plan_migration`).
+- Migration runs automatically on startup (`run_plan_migration`); schema
+  migrations applied via the versioned SQL migration runner in `app/db.py`.
 
 ### Backend API (`plan_routes.py` — 24 endpoints)
 - **Plan CRUD**: `GET /plan`, `GET/POST/PUT/DELETE .../plan/draft`,
@@ -188,14 +189,14 @@ patient see how daily behaviors move long-term outcomes.
   6 metrics (steps, sleep, meditation, mood, BP, lisinopril), 3 outcome
   targets (HbA1c < 5.6%, LDL < 100, Vitamin D ≥ 30), 3 phases.
 - Existing domain logs are re-pointed to the new metric IDs on seed.
-- `--force` re-seeds the plan (idempotent check via `_has_active_plan_sync`).
+- `--force` re-seeds the plan (idempotent check via `has_active_plan`).
 
 ## 9. Patient ↔ Practitioner Real-Time Text Chat
 
 WhatsApp-style 1:1 text messaging between a patient and their connected
 practitioner. Both sides see a chat thread with message bubbles, send
 messages in real time, load conversation history on open, and get typing
-indicators + read receipts. Messages persist in SQLite.
+indicators + read receipts. Messages persist in PostgreSQL.
 
 ### Transport: Socket.io on FastAPI
 - One `python-socketio` **AsyncServer** mounted on the FastAPI app at
@@ -220,7 +221,8 @@ indicators + read receipts. Messages persist in SQLite.
 - **`ws_tokens`** — short-lived single-use tokens for practitioner socket
   auth (token, practitioner_id, created_at, used). TTL 60s.
 - Conversation list queries return last message preview + unread count.
-- Migration runs automatically on startup (`_init_chat_db_sync`).
+- Schema created by the versioned SQL migration runner in `app/db.py`
+  (no per-module sync init needed).
 
 ### Backend API (`chat_routes.py`)
 - **Patient-facing** (`/chat`): `GET /conversations`,
@@ -284,4 +286,76 @@ indicators + read receipts. Messages persist in SQLite.
 ### Dependencies
 - Backend: `python-socketio` (added via `uv add`).
 - Frontend + Practitioner: `socket.io-client` (added via `npm install`).
+
+## 10. PostgreSQL Migration (SQLite → psycopg3 async)
+
+Migrated the entire persistence layer from SQLite (sync `sqlite3` +
+`threading.Lock`) to PostgreSQL via `psycopg3` async with a shared connection
+pool. All four DB modules (`database.py`, `practitioner_db.py`, `chat_db.py`,
+`plan_db.py`) were rewritten; every sync `_*_sync` helper was removed in favor
+of natively async functions.
+
+### Connection pool + migrations (`app/db.py`)
+- `AsyncConnectionPool` from `psycopg.pool`, initialized on FastAPI startup
+  (`init_pool`) and closed on shutdown (`close_pool`).
+- `DATABASE_URL` env var (default `postgresql://bloom:bloom@localhost:5432/bloom2`).
+- Query helpers: `fetchone`, `fetchall`, `execute`, `get_conn` (context
+  manager for multi-statement transactions), `now` (timezone-aware UTC).
+- **Versioned SQL migration runner** — reads `backend/migrations/*.sql` in
+  order, tracks applied scripts in `_schema_migrations` table, idempotent.
+
+### Schema (`backend/migrations/`)
+- `001_initial_schema.sql` — all 20 tables with PostgreSQL-native types:
+  `BIGSERIAL` IDs, `BOOLEAN` flags, `TIMESTAMPTZ` timestamps, `JSONB` for
+  flexible blob columns (profile_json, plan_json, log_json, actions,
+  outcomes_json, metrics_json, phases_json, suggestion_json), `TEXT` for
+  free-form strings. Foreign keys with proper ordering (plan tables before
+  daily_logs).
+- `002_indexes.sql` — all secondary indexes for query performance.
+
+### SQL conversions applied
+- `?` placeholders → `%s`
+- `INTEGER` 0/1 booleans → native `BOOLEAN` (with `bool()` wrapping on read)
+- `AUTOINCREMENT` → `BIGSERIAL` / `RETURNING id` (no more `lastrowid`)
+- `LIKE` → `ILIKE` for case-insensitive search
+- `IS ?` → `IS NOT DISTINCT FROM %s` for nullable-equality upserts
+- `INSERT OR IGNORE` / `INSERT OR REPLACE` → `INSERT ... ON CONFLICT ... DO UPDATE/NOTHING`
+- `threading.Lock` serialization → async connection pool (no locks needed)
+- JSONB columns return Python objects directly (no manual `json.loads` on read)
+- `onboarded_at` changed from `TEXT` to `TIMESTAMPTZ`; `get_profile` converts
+  back to ISO string for backward compat with downstream string parsing.
+
+### Files touched
+- `app/db.py` (new) — pool, migration runner, helpers
+- `app/database.py` — full rewrite (patient auth, profiles, docs, schedules,
+  logs, biomarkers, cascade delete)
+- `app/practitioner_db.py` — full rewrite (practitioners, appointments,
+  connections, notes, tokens)
+- `app/chat_db.py` — full rewrite (messages, WS tokens)
+- `app/plan_db.py` — full rewrite (plans, metrics, outcomes, phases, drafts,
+  suggestions, metric logs, default-plan migration)
+- `app/seed.py` — updated to use async DB functions; pool lifecycle managed
+  in `main()` wrapper
+- `app/main.py` — `init_pool()`/`close_pool()` added to startup/shutdown
+- `app/plan_design_agent/tools.py` — removed dead sync helper stubs
+- `backend/.env.example` — added `DATABASE_URL`
+- `backend/pyproject.toml` — added `psycopg[binary,pool]>=3.2`
+- `backend/AGENTS.md` (new) — DB setup documentation
+
+### Verification
+- All 4 DB modules import cleanly.
+- Comprehensive integration test passed: user auth (register/verify/dedup/
+  token lifecycle), profiles, docs, schedules, daily logs, biomarkers (with
+  dedup), practitioners (register/verify/search/update/token), appointments
+  (create/list/status transitions), connections (ensure/has/list/save AI
+  summary), notes, chat (save/list/mark read/unread/conversations/WS token
+  single-use + TTL), plans (create with child rows/get active/metric IDs),
+  metric logs, drafts (create/get/update/replace/publish), suggestions
+  (add/list/decide), cascade delete.
+- Full seed script ran successfully against a local PostgreSQL 17 container:
+  1 user, 1 profile, 3 practitioners, 1 appointment, 1 plan (6 metrics, 3
+  outcomes, 3 phases), 22 daily logs (17 re-pointed to metric IDs), 10
+  biomarkers, 6 chat messages, 1 connection.
+- Idempotency verified (re-run skips; `--force` wipes and re-seeds).
+- JSONB data verified queryable with `->>` operator.
 

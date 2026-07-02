@@ -47,32 +47,15 @@ def _get_state(tool_context: ToolContext) -> tuple[str, int]:
 
 
 def _ensure_draft(username: str, practitioner_id: int) -> dict:
-    """Get the current unpublished draft, or create an empty one if none."""
-    draft = _get_unpublished_draft_sync(username)
-    if draft:
-        return draft
-    import asyncio
-    return asyncio.get_event_loop().run_until_complete(
-        create_draft(username, practitioner_id)
-    ) if False else _create_draft_sync(username, practitioner_id)
+    """Get the current unpublished draft, or create an empty one if none.
 
-
-def _get_unpublished_draft_sync(username: str) -> dict | None:
-    """Synchronous draft fetch (the async wrapper is in plan_db)."""
-    from app.plan_db import _get_unpublished_draft_sync as _g
-    return _g(username)
-
-
-def _create_draft_sync(username: str, practitioner_id: int) -> dict:
-    """Synchronous draft creation."""
-    from app.plan_db import _create_draft_sync as _c
-    return _c(username, practitioner_id)
-
-
-def _update_draft_sync(username: str, **kwargs) -> dict | None:
-    """Synchronous draft update."""
-    from app.plan_db import _update_draft_sync as _u
-    return _u(username, **kwargs)
+    Note: This is a legacy sync helper. All tool functions are async and use
+    the async ``get_unpublished_draft`` / ``create_draft`` directly.
+    """
+    raise NotImplementedError(
+        "Sync draft access is not supported with the async PostgreSQL backend. "
+        "Use the async get_unpublished_draft / create_draft functions instead."
+    )
 
 
 # ---------------------------------------------------------------------------

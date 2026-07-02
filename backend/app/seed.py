@@ -519,17 +519,16 @@ async def seed_demo_practitioners(force: bool = False) -> bool:
     await init_db()
 
     if force:
-        import sqlite3
-        from app.database import DB_PATH, _lock
-        with _lock, sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM practitioner_patient_connections")
-            conn.execute("DELETE FROM appointments")
-            conn.execute("DELETE FROM practitioner_notes")
-            conn.execute("DELETE FROM practitioner_tokens")
-            conn.execute("DELETE FROM practitioners")
-            conn.execute("DELETE FROM chat_messages")
-            conn.execute("DELETE FROM ws_tokens")
-            conn.commit()
+        from app.db import get_conn
+        async with get_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM practitioner_patient_connections")
+                await cur.execute("DELETE FROM appointments")
+                await cur.execute("DELETE FROM practitioner_notes")
+                await cur.execute("DELETE FROM practitioner_tokens")
+                await cur.execute("DELETE FROM practitioners")
+                await cur.execute("DELETE FROM chat_messages")
+                await cur.execute("DELETE FROM ws_tokens")
         logger.info("Seed: --force wiped all practitioner + chat data.")
 
     created = []
@@ -585,12 +584,11 @@ async def _seed_demo_chat(practitioner_id: int, practitioner_username: str) -> N
     """Seed a short demo chat conversation between the demo patient and the
     given practitioner. Idempotent: skips if any messages already exist for
     this conversation."""
-    from app.chat_db import _save_message_sync, _list_messages_sync
-    from app.chat_db import _conversation_id
+    from app.chat_db import save_message, list_messages, _conversation_id
     from app.practitioner_db import ensure_connection
 
     conv = _conversation_id(practitioner_id, DEMO_USERNAME)
-    existing = _list_messages_sync(conv, limit=1)
+    existing = await list_messages(conv, limit=1)
     if existing:
         return
 
@@ -606,7 +604,7 @@ async def _seed_demo_chat(practitioner_id: int, practitioner_username: str) -> N
         ("practitioner", "Absolutely — the sleep logs are really helpful for spotting patterns. Keep it up! 👍"),
     ]
     for sender, body in demo_messages:
-        _save_message_sync(practitioner_id, DEMO_USERNAME, sender, body)
+        await save_message(practitioner_id, DEMO_USERNAME, sender, body)
     logger.info(
         "Seed: created demo chat conversation between '%s' and '%s' (%d messages).",
         DEMO_USERNAME, practitioner_username, len(demo_messages),
@@ -706,13 +704,13 @@ async def _seed_demo_tracking_plan() -> None:
     Re-points the existing daily logs to the new metric IDs.
     """
     from app.plan_db import (
-        _has_active_plan_sync,
-        _create_plan_sync,
-        _migrate_domain_logs_for_patient_sync,
+        has_active_plan,
+        create_plan,
+        _migrate_domain_logs_for_patient,
     )
     from app.metric_templates import DOMAIN_TO_TEMPLATE
 
-    if _has_active_plan_sync(DEMO_USERNAME):
+    if await has_active_plan(DEMO_USERNAME):
         logger.info("Seed: demo patient already has an active plan — skipping plan creation.")
         return
 
@@ -876,7 +874,7 @@ async def _seed_demo_tracking_plan() -> None:
         },
     ]
 
-    plan = _create_plan_sync(
+    plan = await create_plan(
         patient_username=DEMO_USERNAME,
         practitioner_id=practitioner_id,
         title="Metabolic Health & Sleep Optimization — 90 Days",
@@ -901,13 +899,11 @@ async def _seed_demo_tracking_plan() -> None:
     metric_id_by_template: dict[str, int] = {}
     for m in plan["metrics"]:
         metric_id_by_template[m["template_id"]] = m["id"]
-    import sqlite3
-    from app.database import DB_PATH, _lock
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        updated = _migrate_domain_logs_for_patient_sync(
+    from app.db import get_conn
+    async with get_conn() as conn:
+        updated = await _migrate_domain_logs_for_patient(
             conn, DEMO_USERNAME, plan["id"], metric_id_by_template
         )
-        conn.commit()
     if updated:
         logger.info("Seed: re-pointed %d daily log rows to new metric IDs.", updated)
 
@@ -941,13 +937,21 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+    async def _run_with_pool(coro_func, **kwargs):
+        from app.db import init_pool, close_pool
+        await init_pool()
+        try:
+            await coro_func(**kwargs)
+        finally:
+            await close_pool()
+
     args = sys.argv[1:]
     if "--check" in args:
-        asyncio.run(check_seed_status())
+        asyncio.run(_run_with_pool(check_seed_status))
     elif "--force" in args:
-        asyncio.run(seed_demo_data(force=True))
+        asyncio.run(_run_with_pool(seed_demo_data, force=True))
     else:
-        asyncio.run(seed_demo_data())
+        asyncio.run(_run_with_pool(seed_demo_data))
 
 
 if __name__ == "__main__":

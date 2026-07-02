@@ -1,12 +1,10 @@
-"""SQLite-backed store for tracking plans, plan metrics, outcomes, phases,
+"""PostgreSQL-backed store for tracking plans, plan metrics, outcomes, phases,
 and plan drafts.
 
-Mirrors the sync-function + async-wrapper pattern used in ``database.py``.
-Shares the same ``auth.db`` file and the same ``_lock`` so writes are
-serialized across the patient and practitioner stores.
+Uses ``psycopg3`` (async) via the shared connection pool in ``app.db``.
+Replaces the old SQLite + threading.Lock pattern.
 
-Tables (created in ``_init_plan_db_sync``, called from
-``database._init_db_sync``):
+Tables (created by the migration runner in ``app.db``):
   - plans
   - plan_outcomes
   - plan_metrics
@@ -14,212 +12,66 @@ Tables (created in ``_init_plan_db_sync``, called from
   - plan_drafts
   - plan_suggestions
 
-The ``daily_logs`` table gains a ``metric_id`` column (added in
-``database._init_db_sync``) that references ``plan_metrics.id``.
+The ``daily_logs`` table has a ``metric_id`` column (FK to plan_metrics.id).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import sqlite3
-from datetime import date, timedelta
 
-from app.database import DB_PATH, _lock, _now, _column_exists
-
-
-# ---------------------------------------------------------------------------
-# Schema initialization
-# ---------------------------------------------------------------------------
-def _init_plan_db_sync() -> None:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_username TEXT NOT NULL,
-                practitioner_id INTEGER,
-                version INTEGER NOT NULL DEFAULT 1,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                title TEXT,
-                rationale TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plans_patient_active "
-            "ON plans (patient_username, is_active)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plan_outcomes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                plan_id INTEGER NOT NULL,
-                biomarker_name TEXT NOT NULL,
-                target_value REAL NOT NULL,
-                target_direction TEXT NOT NULL,
-                target_high REAL,
-                unit TEXT NOT NULL,
-                target_date TEXT,
-                current_value REAL,
-                current_as_of TEXT,
-                FOREIGN KEY (plan_id) REFERENCES plans(id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plan_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                plan_id INTEGER NOT NULL,
-                template_id TEXT NOT NULL,
-                label TEXT NOT NULL,
-                unit TEXT NOT NULL,
-                frequency TEXT NOT NULL,
-                time_of_day TEXT,
-                target_type TEXT NOT NULL,
-                target_value REAL,
-                target_high REAL,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                phase INTEGER,
-                sort_order INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY (plan_id) REFERENCES plans(id)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plan_metrics_plan "
-            "ON plan_metrics (plan_id, sort_order)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plan_phases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                plan_id INTEGER NOT NULL,
-                phase_number INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                focus TEXT,
-                actions TEXT,
-                day_start INTEGER NOT NULL,
-                day_end INTEGER NOT NULL,
-                FOREIGN KEY (plan_id) REFERENCES plans(id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plan_drafts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_username TEXT NOT NULL,
-                practitioner_id INTEGER NOT NULL,
-                title TEXT,
-                rationale TEXT,
-                outcomes_json TEXT,
-                metrics_json TEXT,
-                phases_json TEXT,
-                is_published INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plan_drafts_patient_unpublished "
-            "ON plan_drafts (patient_username, is_published)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plan_suggestions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_username TEXT NOT NULL,
-                practitioner_id INTEGER,
-                source TEXT NOT NULL,
-                suggestion_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL,
-                decided_at TEXT,
-                decided_by INTEGER
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plan_suggestions_patient "
-            "ON plan_suggestions (patient_username, status)"
-        )
-        # Add metric_id column to daily_logs (safe migration).
-        if not _column_exists(conn, "daily_logs", "metric_id"):
-            conn.execute(
-                "ALTER TABLE daily_logs ADD COLUMN metric_id INTEGER REFERENCES plan_metrics(id)"
-            )
-        conn.commit()
+from app.db import execute, fetchall, fetchone, get_conn, now
 
 
 # ---------------------------------------------------------------------------
 # Row -> dict helpers
 # ---------------------------------------------------------------------------
-def _plan_row_to_dict(row: tuple) -> dict:
-    cols = (
+def _plan_row_to_dict(row: dict) -> dict:
+    d = {k: row.get(k) for k in (
         "id", "patient_username", "practitioner_id", "version", "is_active",
         "title", "rationale", "created_at", "updated_at",
-    )
-    d = dict(zip(cols, row))
+    )}
     d["is_active"] = bool(d["is_active"])
-    d["practitioner_id"] = d["practitioner_id"]  # may be None
     return d
 
 
-def _outcome_row_to_dict(row: tuple) -> dict:
-    cols = (
+def _outcome_row_to_dict(row: dict) -> dict:
+    return {k: row.get(k) for k in (
         "id", "plan_id", "biomarker_name", "target_value", "target_direction",
         "target_high", "unit", "target_date", "current_value", "current_as_of",
-    )
-    return dict(zip(cols, row))
+    )}
 
 
-def _metric_row_to_dict(row: tuple) -> dict:
-    cols = (
+def _metric_row_to_dict(row: dict) -> dict:
+    d = {k: row.get(k) for k in (
         "id", "plan_id", "template_id", "label", "unit", "frequency",
         "time_of_day", "target_type", "target_value", "target_high",
         "is_active", "phase", "sort_order",
-    )
-    d = dict(zip(cols, row))
+    )}
     d["is_active"] = bool(d["is_active"])
     return d
 
 
-def _phase_row_to_dict(row: tuple) -> dict:
-    cols = (
+def _phase_row_to_dict(row: dict) -> dict:
+    d = {k: row.get(k) for k in (
         "id", "plan_id", "phase_number", "name", "focus", "actions",
         "day_start", "day_end",
-    )
-    d = dict(zip(cols, row))
-    if d.get("actions"):
-        try:
-            d["actions"] = json.loads(d["actions"])
-        except (json.JSONDecodeError, TypeError):
-            d["actions"] = []
-    else:
+    )}
+    # actions is JSONB — psycopg returns it as a Python list/dict already.
+    if d.get("actions") is None:
         d["actions"] = []
     return d
 
 
-def _draft_row_to_dict(row: tuple) -> dict:
-    cols = (
+def _draft_row_to_dict(row: dict) -> dict:
+    d = {k: row.get(k) for k in (
         "id", "patient_username", "practitioner_id", "title", "rationale",
         "outcomes_json", "metrics_json", "phases_json", "is_published",
         "created_at", "updated_at",
-    )
-    d = dict(zip(cols, row))
+    )}
     d["is_published"] = bool(d["is_published"])
+    # JSONB columns come back as Python objects (list/dict) already.
     for k in ("outcomes_json", "metrics_json", "phases_json"):
-        if d.get(k):
-            try:
-                d[k] = json.loads(d[k])
-            except (json.JSONDecodeError, TypeError):
-                d[k] = [] if k != "outcomes_json" else []
-        else:
+        if d.get(k) is None:
             d[k] = []
     return d
 
@@ -227,110 +79,69 @@ def _draft_row_to_dict(row: tuple) -> dict:
 # ---------------------------------------------------------------------------
 # Plans (active plan CRUD + queries)
 # ---------------------------------------------------------------------------
-def _get_active_plan_sync(patient_username: str) -> dict | None:
-    """Return the active plan for a patient with all child rows, or None."""
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        plan_row = conn.execute(
-            "SELECT id, patient_username, practitioner_id, version, is_active, "
-            "title, rationale, created_at, updated_at FROM plans "
-            "WHERE patient_username = ? AND is_active = 1 "
-            "ORDER BY version DESC LIMIT 1",
-            (patient_username,),
-        ).fetchone()
-        if not plan_row:
-            return None
-        plan = _plan_row_to_dict(plan_row)
-        plan["outcomes"] = _fetch_outcomes(conn, plan["id"])
-        plan["metrics"] = _fetch_metrics(conn, plan["id"])
-        plan["phases"] = _fetch_phases(conn, plan["id"])
-        return plan
-
-
-def _fetch_outcomes(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
-    rows = conn.execute(
+async def _fetch_outcomes(conn, plan_id: int) -> list[dict]:
+    cur = conn.cursor()
+    await cur.execute(
         "SELECT id, plan_id, biomarker_name, target_value, target_direction, "
         "target_high, unit, target_date, current_value, current_as_of "
-        "FROM plan_outcomes WHERE plan_id = ? ORDER BY id ASC",
+        "FROM plan_outcomes WHERE plan_id = %s ORDER BY id ASC",
         (plan_id,),
-    ).fetchall()
+    )
+    rows = await cur.fetchall()
     return [_outcome_row_to_dict(r) for r in rows]
 
 
-def _fetch_metrics(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
-    rows = conn.execute(
+async def _fetch_metrics(conn, plan_id: int) -> list[dict]:
+    cur = conn.cursor()
+    await cur.execute(
         "SELECT id, plan_id, template_id, label, unit, frequency, time_of_day, "
         "target_type, target_value, target_high, is_active, phase, sort_order "
-        "FROM plan_metrics WHERE plan_id = ? ORDER BY sort_order ASC, id ASC",
+        "FROM plan_metrics WHERE plan_id = %s ORDER BY sort_order ASC, id ASC",
         (plan_id,),
-    ).fetchall()
+    )
+    rows = await cur.fetchall()
     return [_metric_row_to_dict(r) for r in rows]
 
 
-def _fetch_phases(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
-    rows = conn.execute(
+async def _fetch_phases(conn, plan_id: int) -> list[dict]:
+    cur = conn.cursor()
+    await cur.execute(
         "SELECT id, plan_id, phase_number, name, focus, actions, day_start, day_end "
-        "FROM plan_phases WHERE plan_id = ? ORDER BY phase_number ASC",
+        "FROM plan_phases WHERE plan_id = %s ORDER BY phase_number ASC",
         (plan_id,),
-    ).fetchall()
+    )
+    rows = await cur.fetchall()
     return [_phase_row_to_dict(r) for r in rows]
 
 
-def _create_plan_sync(
-    patient_username: str,
-    practitioner_id: int | None,
-    title: str | None,
-    rationale: str | None,
-    outcomes: list[dict],
-    metrics: list[dict],
-    phases: list[dict],
-) -> dict:
-    """Create a new active plan (new version), archiving any prior active plan.
-
-    Returns the new plan dict (with child rows).
-    """
-    now = _now()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        # Determine the next version number.
-        prior_version = conn.execute(
-            "SELECT MAX(version) FROM plans WHERE patient_username = ?",
-            (patient_username,),
-        ).fetchone()
-        next_version = (prior_version[0] or 0) + 1
-        # Archive any existing active plan.
-        conn.execute(
-            "UPDATE plans SET is_active = 0 WHERE patient_username = ? AND is_active = 1",
+async def get_active_plan(patient_username: str) -> dict | None:
+    """Return the active plan for a patient with all child rows, or None."""
+    async with get_conn() as conn:
+        cur = conn.cursor()
+        await cur.execute(
+            "SELECT id, patient_username, practitioner_id, version, is_active, "
+            "title, rationale, created_at, updated_at FROM plans "
+            "WHERE patient_username = %s AND is_active = TRUE "
+            "ORDER BY version DESC LIMIT 1",
             (patient_username,),
         )
-        cur = conn.execute(
-            "INSERT INTO plans (patient_username, practitioner_id, version, "
-            "is_active, title, rationale, created_at, updated_at) "
-            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-            (patient_username, practitioner_id, next_version, title, rationale, now, now),
-        )
-        plan_id = cur.lastrowid
-        _insert_outcomes(conn, plan_id, outcomes)
-        _insert_metrics(conn, plan_id, metrics)
-        _insert_phases(conn, plan_id, phases)
-        conn.commit()
-        plan = _plan_row_to_dict(
-            conn.execute(
-                "SELECT id, patient_username, practitioner_id, version, is_active, "
-                "title, rationale, created_at, updated_at FROM plans WHERE id = ?",
-                (plan_id,),
-            ).fetchone()
-        )
-        plan["outcomes"] = _fetch_outcomes(conn, plan_id)
-        plan["metrics"] = _fetch_metrics(conn, plan_id)
-        plan["phases"] = _fetch_phases(conn, plan_id)
+        plan_row = await cur.fetchone()
+        if not plan_row:
+            return None
+        plan = _plan_row_to_dict(plan_row)
+        plan["outcomes"] = await _fetch_outcomes(conn, plan["id"])
+        plan["metrics"] = await _fetch_metrics(conn, plan["id"])
+        plan["phases"] = await _fetch_phases(conn, plan["id"])
         return plan
 
 
-def _insert_outcomes(conn: sqlite3.Connection, plan_id: int, outcomes: list[dict]) -> None:
+async def _insert_outcomes(conn, plan_id: int, outcomes: list[dict]) -> None:
+    cur = conn.cursor()
     for o in outcomes:
-        conn.execute(
+        await cur.execute(
             "INSERT INTO plan_outcomes (plan_id, biomarker_name, target_value, "
             "target_direction, target_high, unit, target_date, current_value, "
-            "current_as_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "current_as_of) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 plan_id,
                 o.get("biomarker_name", ""),
@@ -345,13 +156,14 @@ def _insert_outcomes(conn: sqlite3.Connection, plan_id: int, outcomes: list[dict
         )
 
 
-def _insert_metrics(conn: sqlite3.Connection, plan_id: int, metrics: list[dict]) -> None:
+async def _insert_metrics(conn, plan_id: int, metrics: list[dict]) -> None:
+    cur = conn.cursor()
     for i, m in enumerate(metrics):
-        conn.execute(
+        await cur.execute(
             "INSERT INTO plan_metrics (plan_id, template_id, label, unit, "
             "frequency, time_of_day, target_type, target_value, target_high, "
             "is_active, phase, sort_order) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 plan_id,
                 m.get("template_id", ""),
@@ -362,82 +174,139 @@ def _insert_metrics(conn: sqlite3.Connection, plan_id: int, metrics: list[dict])
                 m.get("target_type", "minimum"),
                 m.get("target_value"),
                 m.get("target_high"),
-                1 if m.get("is_active", True) else 0,
+                bool(m.get("is_active", True)),
                 m.get("phase"),
                 m.get("sort_order", i),
             ),
         )
 
 
-def _insert_phases(conn: sqlite3.Connection, plan_id: int, phases: list[dict]) -> None:
+async def _insert_phases(conn, plan_id: int, phases: list[dict]) -> None:
+    cur = conn.cursor()
     for p in phases:
         actions = p.get("actions", [])
-        actions_json = json.dumps(actions) if isinstance(actions, list) else (actions or "[]")
-        conn.execute(
+        # actions is stored as JSONB; psycopg adapts Python lists as PG
+        # arrays, not JSON. Convert to a JSON string for the JSONB column.
+        if not isinstance(actions, str):
+            actions = json.dumps(actions)
+        await cur.execute(
             "INSERT INTO plan_phases (plan_id, phase_number, name, focus, actions, "
-            "day_start, day_end) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "day_start, day_end) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 plan_id,
                 int(p.get("phase_number", 1)),
                 p.get("name", ""),
                 p.get("focus", ""),
-                actions_json,
+                actions,
                 int(p.get("day_start", 1)),
                 int(p.get("day_end", 30)),
             ),
         )
 
 
-def _has_active_plan_sync(patient_username: str) -> bool:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM plans WHERE patient_username = ? AND is_active = 1",
+async def create_plan(
+    patient_username: str,
+    practitioner_id: int | None,
+    title: str | None,
+    rationale: str | None,
+    outcomes: list[dict],
+    metrics: list[dict],
+    phases: list[dict],
+) -> dict:
+    """Create a new active plan (new version), archiving any prior active plan.
+
+    Returns the new plan dict (with child rows).
+    """
+    ts = now()
+    async with get_conn() as conn:
+        cur = conn.cursor()
+        # Determine the next version number.
+        await cur.execute(
+            "SELECT MAX(version) AS max_v FROM plans WHERE patient_username = %s",
             (patient_username,),
-        ).fetchone()
+        )
+        prior = await cur.fetchone()
+        next_version = (prior["max_v"] or 0) + 1
+        # Archive any existing active plan.
+        await cur.execute(
+            "UPDATE plans SET is_active = FALSE WHERE patient_username = %s AND is_active = TRUE",
+            (patient_username,),
+        )
+        await cur.execute(
+            "INSERT INTO plans (patient_username, practitioner_id, version, "
+            "is_active, title, rationale, created_at, updated_at) "
+            "VALUES (%s, %s, %s, TRUE, %s, %s, %s, %s) RETURNING id",
+            (patient_username, practitioner_id, next_version, title, rationale, ts, ts),
+        )
+        plan_id = (await cur.fetchone())["id"]
+        await _insert_outcomes(conn, plan_id, outcomes)
+        await _insert_metrics(conn, plan_id, metrics)
+        await _insert_phases(conn, plan_id, phases)
+        # Fetch the complete plan with child rows.
+        await cur.execute(
+            "SELECT id, patient_username, practitioner_id, version, is_active, "
+            "title, rationale, created_at, updated_at FROM plans WHERE id = %s",
+            (plan_id,),
+        )
+        plan = _plan_row_to_dict(await cur.fetchone())
+        plan["outcomes"] = await _fetch_outcomes(conn, plan_id)
+        plan["metrics"] = await _fetch_metrics(conn, plan_id)
+        plan["phases"] = await _fetch_phases(conn, plan_id)
+        return plan
+
+
+async def has_active_plan(patient_username: str) -> bool:
+    row = await fetchone(
+        "SELECT 1 FROM plans WHERE patient_username = %s AND is_active = TRUE",
+        (patient_username,),
+    )
     return row is not None
 
 
-def _get_metric_sync(metric_id: int) -> dict | None:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT id, plan_id, template_id, label, unit, frequency, time_of_day, "
-            "target_type, target_value, target_high, is_active, phase, sort_order "
-            "FROM plan_metrics WHERE id = ?",
-            (metric_id,),
-        ).fetchone()
+async def get_metric(metric_id: int) -> dict | None:
+    row = await fetchone(
+        "SELECT id, plan_id, template_id, label, unit, frequency, time_of_day, "
+        "target_type, target_value, target_high, is_active, phase, sort_order "
+        "FROM plan_metrics WHERE id = %s",
+        (metric_id,),
+    )
     return _metric_row_to_dict(row) if row else None
 
 
-def _list_active_metric_ids_sync(patient_username: str) -> list[int]:
+async def list_active_metric_ids(patient_username: str) -> list[int]:
     """Return the IDs of all metrics in the patient's active plan."""
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT pm.id FROM plan_metrics pm "
-            "JOIN plans p ON pm.plan_id = p.id "
-            "WHERE p.patient_username = ? AND p.is_active = 1 AND pm.is_active = 1 "
-            "ORDER BY pm.sort_order ASC",
-            (patient_username,),
-        ).fetchall()
-    return [r[0] for r in rows]
+    rows = await fetchall(
+        "SELECT pm.id FROM plan_metrics pm "
+        "JOIN plans p ON pm.plan_id = p.id "
+        "WHERE p.patient_username = %s AND p.is_active = TRUE AND pm.is_active = TRUE "
+        "ORDER BY pm.sort_order ASC",
+        (patient_username,),
+    )
+    return [r["id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
 # Plan drafts
 # ---------------------------------------------------------------------------
-def _get_unpublished_draft_sync(patient_username: str) -> dict | None:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT id, patient_username, practitioner_id, title, rationale, "
-            "outcomes_json, metrics_json, phases_json, is_published, "
-            "created_at, updated_at FROM plan_drafts "
-            "WHERE patient_username = ? AND is_published = 0 "
-            "ORDER BY id DESC LIMIT 1",
-            (patient_username,),
-        ).fetchone()
+_DRAFT_COLS = (
+    "id", "patient_username", "practitioner_id", "title", "rationale",
+    "outcomes_json", "metrics_json", "phases_json", "is_published",
+    "created_at", "updated_at",
+)
+_DRAFT_SELECT = ", ".join(_DRAFT_COLS)
+
+
+async def get_unpublished_draft(patient_username: str) -> dict | None:
+    row = await fetchone(
+        f"SELECT {_DRAFT_SELECT} FROM plan_drafts "
+        "WHERE patient_username = %s AND is_published = FALSE "
+        "ORDER BY id DESC LIMIT 1",
+        (patient_username,),
+    )
     return _draft_row_to_dict(row) if row else None
 
 
-def _create_draft_sync(
+async def create_draft(
     patient_username: str,
     practitioner_id: int,
     title: str | None = None,
@@ -447,41 +316,35 @@ def _create_draft_sync(
     phases: list[dict] | None = None,
 ) -> dict:
     """Create a new draft, replacing any existing unpublished draft."""
-    now = _now()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        # Replace any existing unpublished draft.
-        conn.execute(
-            "DELETE FROM plan_drafts WHERE patient_username = ? AND is_published = 0",
-            (patient_username,),
+    ts = now()
+    row = await fetchone(
+        f"""
+        WITH deleted AS (
+            DELETE FROM plan_drafts WHERE patient_username = %s AND is_published = FALSE
         )
-        cur = conn.execute(
-            "INSERT INTO plan_drafts (patient_username, practitioner_id, title, "
-            "rationale, outcomes_json, metrics_json, phases_json, is_published, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-            (
-                patient_username,
-                practitioner_id,
-                title,
-                rationale,
-                json.dumps(outcomes or []),
-                json.dumps(metrics or []),
-                json.dumps(phases or []),
-                now,
-                now,
-            ),
-        )
-        draft_id = cur.lastrowid
-        conn.commit()
-        row = conn.execute(
-            "SELECT id, patient_username, practitioner_id, title, rationale, "
-            "outcomes_json, metrics_json, phases_json, is_published, "
-            "created_at, updated_at FROM plan_drafts WHERE id = ?",
-            (draft_id,),
-        ).fetchone()
+        INSERT INTO plan_drafts (patient_username, practitioner_id, title,
+            rationale, outcomes_json, metrics_json, phases_json, is_published,
+            created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s)
+        RETURNING {_DRAFT_SELECT}
+        """,
+        (
+            patient_username,
+            patient_username,
+            practitioner_id,
+            title,
+            rationale,
+            json.dumps(outcomes or []),
+            json.dumps(metrics or []),
+            json.dumps(phases or []),
+            ts,
+            ts,
+        ),
+    )
     return _draft_row_to_dict(row)
 
 
-def _update_draft_sync(
+async def update_draft(
     patient_username: str,
     title: str | None = None,
     rationale: str | None = None,
@@ -491,64 +354,62 @@ def _update_draft_sync(
 ) -> dict | None:
     """Update fields on the existing unpublished draft. Only non-None fields
     are updated. Returns the updated draft or None if no draft exists."""
-    now = _now()
-    sets: list[str] = ["updated_at = ?"]
-    params: list = [now]
+    sets: list[str] = ["updated_at = %s"]
+    params: list = [now()]
     if title is not None:
-        sets.append("title = ?")
+        sets.append("title = %s")
         params.append(title)
     if rationale is not None:
-        sets.append("rationale = ?")
+        sets.append("rationale = %s")
         params.append(rationale)
     if outcomes is not None:
-        sets.append("outcomes_json = ?")
+        sets.append("outcomes_json = %s")
         params.append(json.dumps(outcomes))
     if metrics is not None:
-        sets.append("metrics_json = ?")
+        sets.append("metrics_json = %s")
         params.append(json.dumps(metrics))
     if phases is not None:
-        sets.append("phases_json = ?")
+        sets.append("phases_json = %s")
         params.append(json.dumps(phases))
     params.append(patient_username)
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
+
+    async with get_conn() as conn:
+        cur = conn.cursor()
+        await cur.execute(
             f"UPDATE plan_drafts SET {', '.join(sets)} "
-            f"WHERE patient_username = ? AND is_published = 0",
-            params,
+            f"WHERE patient_username = %s AND is_published = FALSE",
+            tuple(params),
         )
         if cur.rowcount == 0:
-            conn.commit()
             return None
-        conn.commit()
-        row = conn.execute(
-            "SELECT id, patient_username, practitioner_id, title, rationale, "
-            "outcomes_json, metrics_json, phases_json, is_published, "
-            "created_at, updated_at FROM plan_drafts "
-            "WHERE patient_username = ? AND is_published = 0 "
+        await cur.execute(
+            f"SELECT {_DRAFT_SELECT} FROM plan_drafts "
+            "WHERE patient_username = %s AND is_published = FALSE "
             "ORDER BY id DESC LIMIT 1",
             (patient_username,),
-        ).fetchone()
+        )
+        row = await cur.fetchone()
     return _draft_row_to_dict(row) if row else None
 
 
-def _delete_draft_sync(patient_username: str) -> bool:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "DELETE FROM plan_drafts WHERE patient_username = ? AND is_published = 0",
+async def delete_draft(patient_username: str) -> bool:
+    async with get_conn() as conn:
+        cur = conn.cursor()
+        await cur.execute(
+            "DELETE FROM plan_drafts WHERE patient_username = %s AND is_published = FALSE",
             (patient_username,),
         )
-        conn.commit()
         return cur.rowcount > 0
 
 
-def _publish_draft_sync(patient_username: str) -> dict | None:
+async def publish_draft(patient_username: str) -> dict | None:
     """Publish the current unpublished draft: create a new active plan from
     the draft's JSON, mark the draft as published. Returns the new active plan
     or None if no unpublished draft exists."""
-    draft = _get_unpublished_draft_sync(patient_username)
+    draft = await get_unpublished_draft(patient_username)
     if not draft:
         return None
-    plan = _create_plan_sync(
+    plan = await create_plan(
         patient_username=patient_username,
         practitioner_id=draft["practitioner_id"],
         title=draft.get("title"),
@@ -557,132 +418,125 @@ def _publish_draft_sync(patient_username: str) -> dict | None:
         metrics=draft.get("metrics_json") or [],
         phases=draft.get("phases_json") or [],
     )
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE plan_drafts SET is_published = 1, updated_at = ? "
-            "WHERE id = ?",
-            (_now(), draft["id"]),
-        )
-        conn.commit()
+    await execute(
+        "UPDATE plan_drafts SET is_published = TRUE, updated_at = %s "
+        "WHERE id = %s",
+        (now(), draft["id"]),
+    )
     return plan
 
 
 # ---------------------------------------------------------------------------
 # Plan suggestions (AI-proposed adjustments for practitioner approval)
 # ---------------------------------------------------------------------------
-def _add_plan_suggestion_sync(
+async def add_plan_suggestion(
     patient_username: str,
     practitioner_id: int | None,
     source: str,
     suggestion: dict,
 ) -> dict:
-    now = _now()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT INTO plan_suggestions (patient_username, practitioner_id, "
-            "source, suggestion_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?)",
-            (patient_username, practitioner_id, source, json.dumps(suggestion), now),
-        )
-        sid = cur.lastrowid
-        conn.commit()
+    ts = now()
+    row = await fetchone(
+        "INSERT INTO plan_suggestions (patient_username, practitioner_id, "
+        "source, suggestion_json, status, created_at) "
+        "VALUES (%s, %s, %s, %s, 'pending', %s) RETURNING id",
+        (patient_username, practitioner_id, source, json.dumps(suggestion), ts),
+    )
     return {
-        "id": sid,
+        "id": row["id"],
         "patient_username": patient_username,
         "practitioner_id": practitioner_id,
         "source": source,
         "suggestion": suggestion,
         "status": "pending",
-        "created_at": now,
+        "created_at": ts,
         "decided_at": None,
         "decided_by": None,
     }
 
 
-def _list_plan_suggestions_sync(
+async def list_plan_suggestions(
     patient_username: str, status: str | None = None
 ) -> list[dict]:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        if status:
-            rows = conn.execute(
-                "SELECT id, patient_username, practitioner_id, source, "
-                "suggestion_json, status, created_at, decided_at, decided_by "
-                "FROM plan_suggestions WHERE patient_username = ? AND status = ? "
-                "ORDER BY created_at DESC",
-                (patient_username, status),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, patient_username, practitioner_id, source, "
-                "suggestion_json, status, created_at, decided_at, decided_by "
-                "FROM plan_suggestions WHERE patient_username = ? "
-                "ORDER BY created_at DESC",
-                (patient_username,),
-            ).fetchall()
+    if status:
+        rows = await fetchall(
+            "SELECT id, patient_username, practitioner_id, source, "
+            "suggestion_json, status, created_at, decided_at, decided_by "
+            "FROM plan_suggestions WHERE patient_username = %s AND status = %s "
+            "ORDER BY created_at DESC",
+            (patient_username, status),
+        )
+    else:
+        rows = await fetchall(
+            "SELECT id, patient_username, practitioner_id, source, "
+            "suggestion_json, status, created_at, decided_at, decided_by "
+            "FROM plan_suggestions WHERE patient_username = %s "
+            "ORDER BY created_at DESC",
+            (patient_username,),
+        )
     out = []
     for r in rows:
-        try:
-            suggestion = json.loads(r[4])
-        except (json.JSONDecodeError, TypeError):
-            suggestion = {}
-        out.append(
-            {
-                "id": r[0],
-                "patient_username": r[1],
-                "practitioner_id": r[2],
-                "source": r[3],
-                "suggestion": suggestion,
-                "status": r[5],
-                "created_at": r[6],
-                "decided_at": r[7],
-                "decided_by": r[8],
-            }
-        )
+        # suggestion_json is JSONB — already a Python dict.
+        suggestion = r["suggestion_json"]
+        if not isinstance(suggestion, dict):
+            try:
+                suggestion = json.loads(suggestion) if suggestion else {}
+            except (json.JSONDecodeError, TypeError):
+                suggestion = {}
+        out.append({
+            "id": r["id"],
+            "patient_username": r["patient_username"],
+            "practitioner_id": r["practitioner_id"],
+            "source": r["source"],
+            "suggestion": suggestion,
+            "status": r["status"],
+            "created_at": r["created_at"],
+            "decided_at": r["decided_at"],
+            "decided_by": r["decided_by"],
+        })
     return out
 
 
-def _set_suggestion_status_sync(
-    suggestion_id: int,
-    status: str,
-    decided_by: int | None = None,
+async def set_suggestion_status(
+    suggestion_id: int, status: str, decided_by: int | None = None
 ) -> dict | None:
-    now = _now()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE plan_suggestions SET status = ?, decided_at = ?, decided_by = ? "
-            "WHERE id = ?",
-            (status, now, decided_by, suggestion_id),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT id, patient_username, practitioner_id, source, "
-            "suggestion_json, status, created_at, decided_at, decided_by "
-            "FROM plan_suggestions WHERE id = ?",
-            (suggestion_id,),
-        ).fetchone()
+    ts = now()
+    await execute(
+        "UPDATE plan_suggestions SET status = %s, decided_at = %s, decided_by = %s "
+        "WHERE id = %s",
+        (status, ts, decided_by, suggestion_id),
+    )
+    row = await fetchone(
+        "SELECT id, patient_username, practitioner_id, source, "
+        "suggestion_json, status, created_at, decided_at, decided_by "
+        "FROM plan_suggestions WHERE id = %s",
+        (suggestion_id,),
+    )
     if not row:
         return None
-    try:
-        suggestion = json.loads(row[4])
-    except (json.JSONDecodeError, TypeError):
-        suggestion = {}
+    suggestion = row["suggestion_json"]
+    if not isinstance(suggestion, dict):
+        try:
+            suggestion = json.loads(suggestion) if suggestion else {}
+        except (json.JSONDecodeError, TypeError):
+            suggestion = {}
     return {
-        "id": row[0],
-        "patient_username": row[1],
-        "practitioner_id": row[2],
-        "source": row[3],
+        "id": row["id"],
+        "patient_username": row["patient_username"],
+        "practitioner_id": row["practitioner_id"],
+        "source": row["source"],
         "suggestion": suggestion,
-        "status": row[5],
-        "created_at": row[6],
-        "decided_at": row[7],
-        "decided_by": row[8],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "decided_at": row["decided_at"],
+        "decided_by": row["decided_by"],
     }
 
 
 # ---------------------------------------------------------------------------
 # Daily logs (metric_id-aware helpers)
 # ---------------------------------------------------------------------------
-def _save_metric_log_sync(
+async def save_metric_log(
     username: str,
     iso_date: str,
     metric_id: int,
@@ -692,75 +546,74 @@ def _save_metric_log_sync(
 
     Keeps the old ``domain`` column in sync by looking up the metric's
     template_id (so legacy code paths that read by domain still work during
-    migration). The primary key is extended to include metric_id.
+    migration). The primary key is (username, date, domain).
     """
-    with _lock, sqlite3.connect(DB_PATH) as conn:
+    async with get_conn() as conn:
+        cur = conn.cursor()
         # Look up the metric to get a domain-like value for the legacy column.
-        metric = conn.execute(
-            "SELECT template_id FROM plan_metrics WHERE id = ?", (metric_id,)
-        ).fetchone()
-        domain = metric[0] if metric else "other"
-        conn.execute(
+        await cur.execute(
+            "SELECT template_id FROM plan_metrics WHERE id = %s", (metric_id,)
+        )
+        metric = await cur.fetchone()
+        domain = metric["template_id"] if metric else "other"
+        await cur.execute(
             """
             INSERT INTO daily_logs (username, date, domain, metric_id, log_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT(username, date, domain) DO UPDATE SET
-                metric_id = excluded.metric_id,
-                log_json = excluded.log_json,
-                updated_at = excluded.updated_at
+                metric_id = EXCLUDED.metric_id,
+                log_json = EXCLUDED.log_json,
+                updated_at = EXCLUDED.updated_at
             """,
-            (username, iso_date, domain, metric_id, log_json, _now()),
+            (username, iso_date, domain, metric_id, log_json, now()),
         )
-        conn.commit()
 
 
-def _get_metric_logs_sync(username: str, iso_date: str) -> dict[int, list[dict]]:
+async def get_metric_logs(username: str, iso_date: str) -> dict[int, list[dict]]:
     """Return all metric logs for a user on a date, keyed by metric_id."""
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT metric_id, log_json FROM daily_logs "
-            "WHERE username = ? AND date = ? AND metric_id IS NOT NULL",
-            (username, iso_date),
-        ).fetchall()
+    rows = await fetchall(
+        "SELECT metric_id, log_json FROM daily_logs "
+        "WHERE username = %s AND date = %s AND metric_id IS NOT NULL",
+        (username, iso_date),
+    )
     out: dict[int, list[dict]] = {}
-    for metric_id, log_json in rows:
-        if metric_id is None:
+    for row in rows:
+        mid = row["metric_id"]
+        if mid is None:
             continue
-        try:
-            out[metric_id] = json.loads(log_json)
-        except (json.JSONDecodeError, TypeError):
-            out[metric_id] = []
+        lj = row["log_json"]
+        # log_json is JSONB — already a Python list.
+        out[mid] = lj if isinstance(lj, list) else []
     return out
 
 
-def _get_recent_metric_logs_sync(
+async def get_recent_metric_logs(
     username: str, metric_id: int, days: int
 ) -> list[dict]:
     """Return the last `days` days of logs for a single metric, oldest first."""
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT date, log_json FROM daily_logs "
-            "WHERE username = ? AND metric_id = ? "
-            "ORDER BY date DESC LIMIT ?",
-            (username, metric_id, days),
-        ).fetchall()
-    out = [{"date": d, "entries": json.loads(j)} for d, j in rows]
+    rows = await fetchall(
+        "SELECT date, log_json FROM daily_logs "
+        "WHERE username = %s AND metric_id = %s "
+        "ORDER BY date DESC LIMIT %s",
+        (username, metric_id, days),
+    )
+    out = [{"date": r["date"], "entries": r["log_json"]} for r in rows]
     out.reverse()
     return out
 
 
-def _get_all_metric_logs_range_sync(
+async def get_all_metric_logs_range(
     username: str, metric_id: int, days: int
 ) -> list[dict]:
     """Return logs for a metric over the last `days` days (same as recent)."""
-    return _get_recent_metric_logs_sync(username, metric_id, days)
+    return await get_recent_metric_logs(username, metric_id, days)
 
 
 # ---------------------------------------------------------------------------
 # Migration: create default plans for existing onboarded patients
 # ---------------------------------------------------------------------------
-def _migrate_domain_logs_for_patient_sync(
-    conn: sqlite3.Connection,
+async def _migrate_domain_logs_for_patient(
+    conn,
     patient_username: str,
     plan_id: int,
     metric_id_by_template: dict[str, int],
@@ -768,30 +621,30 @@ def _migrate_domain_logs_for_patient_sync(
     """Re-point existing daily_logs rows (with domain values) to the new
     metric IDs in the default plan. Returns the number of rows updated."""
     from app.metric_templates import DOMAIN_TO_TEMPLATE
+    cur = conn.cursor()
     updated = 0
     for domain, template_id in DOMAIN_TO_TEMPLATE.items():
         metric_id = metric_id_by_template.get(template_id)
         if metric_id is None:
             continue
-        cur = conn.execute(
-            "UPDATE daily_logs SET metric_id = ? "
-            "WHERE username = ? AND domain = ? AND metric_id IS NULL",
+        await cur.execute(
+            "UPDATE daily_logs SET metric_id = %s "
+            "WHERE username = %s AND domain = %s AND metric_id IS NULL",
             (metric_id, patient_username, domain),
         )
         updated += cur.rowcount
     return updated
 
 
-def _create_default_plan_for_patient_sync(
-    patient_username: str,
-    plan_json: dict | None,
+async def create_default_plan_for_patient(
+    patient_username: str, plan_json: dict | None
 ) -> dict | None:
     """Create a default plan for an existing onboarded patient, mapping the
     old 6 wellness domains to template metrics. Idempotent — skips if the
     patient already has an active plan."""
     from app.metric_templates import DOMAIN_TO_TEMPLATE, get_template
 
-    if _has_active_plan_sync(patient_username):
+    if await has_active_plan(patient_username):
         return None
 
     summary = (plan_json or {}).get("summary", "Wellness Plan")
@@ -848,7 +701,7 @@ def _create_default_plan_for_patient_sync(
         )
         sort += 1
 
-    plan = _create_plan_sync(
+    plan = await create_plan(
         patient_username=patient_username,
         practitioner_id=None,
         title=summary,
@@ -862,176 +715,24 @@ def _create_default_plan_for_patient_sync(
     metric_id_by_template: dict[str, int] = {}
     for m in plan["metrics"]:
         metric_id_by_template[m["template_id"]] = m["id"]
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        _migrate_domain_logs_for_patient_sync(
+    async with get_conn() as conn:
+        updated = await _migrate_domain_logs_for_patient(
             conn, patient_username, plan["id"], metric_id_by_template
         )
-        conn.commit()
     return plan
 
 
-def _run_plan_migration_sync() -> None:
+async def run_plan_migration() -> None:
     """Run the migration: for each onboarded patient with no active plan,
     create a default plan and re-point logs. Idempotent."""
-    from app.database import _get_profile_sync  # avoid circular import at module load
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT username FROM user_profiles WHERE onboarded = 1"
-        ).fetchall()
-    for (username,) in rows:
-        if _has_active_plan_sync(username):
+    from app.database import get_profile  # avoid circular import at module load
+    rows = await fetchall(
+        "SELECT username FROM user_profiles WHERE onboarded = TRUE"
+    )
+    for row in rows:
+        username = row["username"]
+        if await has_active_plan(username):
             continue
-        profile_data = _get_profile_sync(username)
+        profile_data = await get_profile(username)
         plan_json = profile_data.get("plan") if profile_data else None
-        _create_default_plan_for_patient_sync(username, plan_json)
-
-
-# ---------------------------------------------------------------------------
-# Async wrappers
-# ---------------------------------------------------------------------------
-async def get_active_plan(patient_username: str) -> dict | None:
-    return await asyncio.to_thread(_get_active_plan_sync, patient_username)
-
-
-async def create_plan(
-    patient_username: str,
-    practitioner_id: int | None,
-    title: str | None,
-    rationale: str | None,
-    outcomes: list[dict],
-    metrics: list[dict],
-    phases: list[dict],
-) -> dict:
-    return await asyncio.to_thread(
-        _create_plan_sync,
-        patient_username,
-        practitioner_id,
-        title,
-        rationale,
-        outcomes,
-        metrics,
-        phases,
-    )
-
-
-async def has_active_plan(patient_username: str) -> bool:
-    return await asyncio.to_thread(_has_active_plan_sync, patient_username)
-
-
-async def get_metric(metric_id: int) -> dict | None:
-    return await asyncio.to_thread(_get_metric_sync, metric_id)
-
-
-async def list_active_metric_ids(patient_username: str) -> list[int]:
-    return await asyncio.to_thread(_list_active_metric_ids_sync, patient_username)
-
-
-async def get_unpublished_draft(patient_username: str) -> dict | None:
-    return await asyncio.to_thread(_get_unpublished_draft_sync, patient_username)
-
-
-async def create_draft(
-    patient_username: str,
-    practitioner_id: int,
-    title: str | None = None,
-    rationale: str | None = None,
-    outcomes: list[dict] | None = None,
-    metrics: list[dict] | None = None,
-    phases: list[dict] | None = None,
-) -> dict:
-    return await asyncio.to_thread(
-        _create_draft_sync,
-        patient_username,
-        practitioner_id,
-        title,
-        rationale,
-        outcomes,
-        metrics,
-        phases,
-    )
-
-
-async def update_draft(
-    patient_username: str,
-    title: str | None = None,
-    rationale: str | None = None,
-    outcomes: list[dict] | None = None,
-    metrics: list[dict] | None = None,
-    phases: list[dict] | None = None,
-) -> dict | None:
-    return await asyncio.to_thread(
-        _update_draft_sync,
-        patient_username,
-        title,
-        rationale,
-        outcomes,
-        metrics,
-        phases,
-    )
-
-
-async def delete_draft(patient_username: str) -> bool:
-    return await asyncio.to_thread(_delete_draft_sync, patient_username)
-
-
-async def publish_draft(patient_username: str) -> dict | None:
-    return await asyncio.to_thread(_publish_draft_sync, patient_username)
-
-
-async def add_plan_suggestion(
-    patient_username: str,
-    practitioner_id: int | None,
-    source: str,
-    suggestion: dict,
-) -> dict:
-    return await asyncio.to_thread(
-        _add_plan_suggestion_sync,
-        patient_username,
-        practitioner_id,
-        source,
-        suggestion,
-    )
-
-
-async def list_plan_suggestions(
-    patient_username: str, status: str | None = None
-) -> list[dict]:
-    return await asyncio.to_thread(
-        _list_plan_suggestions_sync, patient_username, status
-    )
-
-
-async def set_suggestion_status(
-    suggestion_id: int, status: str, decided_by: int | None = None
-) -> dict | None:
-    return await asyncio.to_thread(
-        _set_suggestion_status_sync, suggestion_id, status, decided_by
-    )
-
-
-async def save_metric_log(
-    username: str, iso_date: str, metric_id: int, log_json: str
-) -> None:
-    await asyncio.to_thread(_save_metric_log_sync, username, iso_date, metric_id, log_json)
-
-
-async def get_metric_logs(username: str, iso_date: str) -> dict[int, list[dict]]:
-    return await asyncio.to_thread(_get_metric_logs_sync, username, iso_date)
-
-
-async def get_recent_metric_logs(
-    username: str, metric_id: int, days: int
-) -> list[dict]:
-    return await asyncio.to_thread(_get_recent_metric_logs_sync, username, metric_id, days)
-
-
-async def run_plan_migration() -> None:
-    await asyncio.to_thread(_run_plan_migration_sync)
-
-
-async def create_default_plan_for_patient(
-    patient_username: str, plan_json: dict | None
-) -> dict | None:
-    return await asyncio.to_thread(
-        _create_default_plan_for_patient_sync, patient_username, plan_json
-    )
+        await create_default_plan_for_patient(username, plan_json)

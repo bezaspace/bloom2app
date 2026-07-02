@@ -1,11 +1,9 @@
-"""SQLite-backed store for patient <-> practitioner text chat messages.
+"""PostgreSQL-backed store for patient <-> practitioner text chat messages.
 
-Mirrors the sync-function + async-wrapper pattern used in ``database.py`` and
-``practitioner_db.py``. Shares the same ``auth.db`` file and the same ``_lock``
-so writes are serialized across all stores.
+Uses ``psycopg3`` (async) via the shared connection pool in ``app.db``.
+Replaces the old SQLite + threading.Lock pattern.
 
-Tables (created in ``_init_chat_db_sync``, called from
-``database._init_db_sync``):
+Tables (created by the migration runner in ``app.db``):
   - chat_messages  — one row per message in every 1:1 conversation
   - ws_tokens      — short-lived, single-use tokens that let the practitioner
                      web app's browser authenticate a Socket.io connection
@@ -18,12 +16,12 @@ a patient and a practitioner with an active
 by this module.
 """
 
-import asyncio
+from __future__ import annotations
+
 import secrets
-import sqlite3
 from datetime import datetime, timezone
 
-from app.database import DB_PATH, _lock, _now
+from app.db import execute, fetchall, fetchone, get_conn, now
 
 
 # Short-lived WS token validity, in seconds.
@@ -35,50 +33,6 @@ def _conversation_id(practitioner_id: int, patient_username: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Schema initialization
-# ---------------------------------------------------------------------------
-def _init_chat_db_sync() -> None:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                practitioner_id INTEGER NOT NULL,
-                patient_username TEXT NOT NULL,
-                sender TEXT NOT NULL,
-                body TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                read_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chat_conv_id "
-            "ON chat_messages (conversation_id, id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chat_practitioner "
-            "ON chat_messages (practitioner_id, patient_username, id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chat_patient "
-            "ON chat_messages (patient_username, id)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ws_tokens (
-                token TEXT PRIMARY KEY,
-                practitioner_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.commit()
-
-
-# ---------------------------------------------------------------------------
 # Message row helper
 # ---------------------------------------------------------------------------
 _MSG_COLS = (
@@ -87,42 +41,35 @@ _MSG_COLS = (
 )
 
 
-def _msg_row_to_dict(row: tuple) -> dict:
-    d = dict(zip(_MSG_COLS, row))
-    return d
+def _msg_row_to_dict(row: dict) -> dict:
+    return {col: row.get(col) for col in _MSG_COLS}
 
 
 # ---------------------------------------------------------------------------
 # Messages
 # ---------------------------------------------------------------------------
-def _save_message_sync(
+async def save_message(
     practitioner_id: int,
     patient_username: str,
     sender: str,
     body: str,
 ) -> dict:
     conv = _conversation_id(practitioner_id, patient_username)
-    now = _now()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO chat_messages
-                (conversation_id, practitioner_id, patient_username,
-                 sender, body, created_at, read_at)
-            VALUES (?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (conv, practitioner_id, patient_username, sender, body, now),
-        )
-        conn.commit()
-        mid = cur.lastrowid
-        row = conn.execute(
-            f"SELECT {', '.join(_MSG_COLS)} FROM chat_messages WHERE id = ?",
-            (mid,),
-        ).fetchone()
+    row = await fetchone(
+        """
+        INSERT INTO chat_messages
+            (conversation_id, practitioner_id, patient_username,
+             sender, body, created_at, read_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NULL)
+        RETURNING id, conversation_id, practitioner_id, patient_username,
+            sender, body, created_at, read_at
+        """,
+        (conv, practitioner_id, patient_username, sender, body, now()),
+    )
     return _msg_row_to_dict(row)
 
 
-def _list_messages_sync(
+async def list_messages(
     conversation_id: str,
     before_id: int | None = None,
     limit: int = 50,
@@ -130,220 +77,183 @@ def _list_messages_sync(
     """Return messages oldest-first for a conversation, optionally limited to
     those with id < before_id (cursor pagination for "load older")."""
     limit = max(1, min(limit, 200))
+    cols = ", ".join(_MSG_COLS)
     if before_id is not None:
-        query = (
-            f"SELECT {', '.join(_MSG_COLS)} FROM chat_messages "
-            "WHERE conversation_id = ? AND id < ? "
-            "ORDER BY id DESC LIMIT ?"
+        rows = await fetchall(
+            f"SELECT {cols} FROM chat_messages "
+            "WHERE conversation_id = %s AND id < %s "
+            "ORDER BY id DESC LIMIT %s",
+            (conversation_id, before_id, limit),
         )
-        params: tuple = (conversation_id, before_id, limit)
     else:
-        query = (
-            f"SELECT {', '.join(_MSG_COLS)} FROM chat_messages "
-            "WHERE conversation_id = ? "
-            "ORDER BY id DESC LIMIT ?"
+        rows = await fetchall(
+            f"SELECT {cols} FROM chat_messages "
+            "WHERE conversation_id = %s "
+            "ORDER BY id DESC LIMIT %s",
+            (conversation_id, limit),
         )
-        params = (conversation_id, limit)
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(query, params).fetchall()
     # rows come newest-first; reverse for chronological display.
     return [_msg_row_to_dict(r) for r in reversed(rows)]
 
 
-def _mark_read_sync(
+async def mark_read(
     conversation_id: str, reader: str
 ) -> int:
     """Mark all messages in the conversation sent by the *other* party as read.
     ``reader`` is "patient" or "practitioner". Returns the number of rows
     updated."""
     other = "practitioner" if reader == "patient" else "patient"
-    now = _now()
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "UPDATE chat_messages SET read_at = ? "
-            "WHERE conversation_id = ? AND sender = ? AND read_at IS NULL",
-            (now, conversation_id, other),
-        )
-        conn.commit()
-        return cur.rowcount
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE chat_messages SET read_at = %s "
+                "WHERE conversation_id = %s AND sender = %s AND read_at IS NULL",
+                (now(), conversation_id, other),
+            )
+            return cur.rowcount
 
 
-def _unread_count_sync(
+async def unread_count(
     conversation_id: str, reader: str
 ) -> int:
     """Count messages from the other party that are unread by ``reader``."""
     other = "practitioner" if reader == "patient" else "patient"
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM chat_messages "
-            "WHERE conversation_id = ? AND sender = ? AND read_at IS NULL",
-            (conversation_id, other),
-        ).fetchone()
-    return row[0] if row else 0
+    row = await fetchone(
+        "SELECT COUNT(*) AS cnt FROM chat_messages "
+        "WHERE conversation_id = %s AND sender = %s AND read_at IS NULL",
+        (conversation_id, other),
+    )
+    return row["cnt"] if row else 0
 
 
-def _list_conversations_for_practitioner_sync(
+async def list_conversations_for_practitioner(
     practitioner_id: int,
 ) -> list[dict]:
     """One row per patient the practitioner has chatted with, with the latest
     message preview and an unread count for the practitioner."""
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        # Distinct patients in this practitioner's conversations.
-        rows = conn.execute(
-            "SELECT DISTINCT patient_username FROM chat_messages "
-            "WHERE practitioner_id = ?",
-            (practitioner_id,),
-        ).fetchall()
-        out = []
-        for (uname,) in rows:
-            conv = _conversation_id(practitioner_id, uname)
-            last = conn.execute(
-                f"SELECT {', '.join(_MSG_COLS)} FROM chat_messages "
-                "WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
-                (conv,),
-            ).fetchone()
-            unread = conn.execute(
-                "SELECT COUNT(*) FROM chat_messages "
-                "WHERE conversation_id = ? AND sender = 'patient' "
-                "AND read_at IS NULL",
-                (conv,),
-            ).fetchone()[0]
-            out.append({
-                "patient_username": uname,
-                "practitioner_id": practitioner_id,
-                "conversation_id": conv,
-                "last_message": _msg_row_to_dict(last) if last else None,
-                "unread_count": unread,
-            })
+    cols = ", ".join(_MSG_COLS)
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT DISTINCT patient_username FROM chat_messages "
+                "WHERE practitioner_id = %s",
+                (practitioner_id,),
+            )
+            rows = await cur.fetchall()
+            out = []
+            for row in rows:
+                uname = row["patient_username"]
+                conv = _conversation_id(practitioner_id, uname)
+                await cur.execute(
+                    f"SELECT {cols} FROM chat_messages "
+                    "WHERE conversation_id = %s ORDER BY id DESC LIMIT 1",
+                    (conv,),
+                )
+                last = await cur.fetchone()
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM chat_messages "
+                    "WHERE conversation_id = %s AND sender = 'patient' "
+                    "AND read_at IS NULL",
+                    (conv,),
+                )
+                unread_row = await cur.fetchone()
+                out.append({
+                    "patient_username": uname,
+                    "practitioner_id": practitioner_id,
+                    "conversation_id": conv,
+                    "last_message": _msg_row_to_dict(last) if last else None,
+                    "unread_count": unread_row["cnt"] if unread_row else 0,
+                })
     return out
 
 
-def _list_conversations_for_patient_sync(
+async def list_conversations_for_patient(
     patient_username: str,
 ) -> list[dict]:
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT practitioner_id FROM chat_messages "
-            "WHERE patient_username = ?",
-            (patient_username,),
-        ).fetchall()
-        out = []
-        for (pid,) in rows:
-            conv = _conversation_id(pid, patient_username)
-            last = conn.execute(
-                f"SELECT {', '.join(_MSG_COLS)} FROM chat_messages "
-                "WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
-                (conv,),
-            ).fetchone()
-            unread = conn.execute(
-                "SELECT COUNT(*) FROM chat_messages "
-                "WHERE conversation_id = ? AND sender = 'practitioner' "
-                "AND read_at IS NULL",
-                (conv,),
-            ).fetchone()[0]
-            out.append({
-                "patient_username": patient_username,
-                "practitioner_id": pid,
-                "conversation_id": conv,
-                "last_message": _msg_row_to_dict(last) if last else None,
-                "unread_count": unread,
-            })
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT DISTINCT practitioner_id FROM chat_messages "
+                "WHERE patient_username = %s",
+                (patient_username,),
+            )
+            rows = await cur.fetchall()
+            out = []
+            for row in rows:
+                pid = row["practitioner_id"]
+                conv = _conversation_id(pid, patient_username)
+                await cur.execute(
+                    f"SELECT {', '.join(_MSG_COLS)} FROM chat_messages "
+                    "WHERE conversation_id = %s ORDER BY id DESC LIMIT 1",
+                    (conv,),
+                )
+                last = await cur.fetchone()
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM chat_messages "
+                    "WHERE conversation_id = %s AND sender = 'practitioner' "
+                    "AND read_at IS NULL",
+                    (conv,),
+                )
+                unread_row = await cur.fetchone()
+                out.append({
+                    "patient_username": patient_username,
+                    "practitioner_id": pid,
+                    "conversation_id": conv,
+                    "last_message": _msg_row_to_dict(last) if last else None,
+                    "unread_count": unread_row["cnt"] if unread_row else 0,
+                })
     return out
 
 
 # ---------------------------------------------------------------------------
 # Short-lived WebSocket tokens (practitioner browser -> FastAPI socket)
 # ---------------------------------------------------------------------------
-def _create_ws_token_sync(practitioner_id: int) -> tuple[str, int]:
+async def create_ws_token(practitioner_id: int) -> tuple[str, int]:
     """Mint a single-use WS token for a practitioner. Returns (token, ttl)."""
     token = secrets.token_urlsafe(32)
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO ws_tokens (token, practitioner_id, created_at, used) "
-            "VALUES (?, ?, ?, 0)",
-            (token, practitioner_id, _now()),
-        )
-        conn.commit()
+    await execute(
+        "INSERT INTO ws_tokens (token, practitioner_id, created_at, used) "
+        "VALUES (%s, %s, %s, FALSE)",
+        (token, practitioner_id, now()),
+    )
     return token, WS_TOKEN_TTL
 
 
-def _consume_ws_token_sync(token: str) -> int | None:
+async def consume_ws_token(token: str) -> int | None:
     """Verify the token is valid, unused, and within TTL. If so, mark it used
     and return the practitioner_id; otherwise return None."""
-    with _lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT practitioner_id, created_at, used FROM ws_tokens "
-            "WHERE token = ?",
-            (token,),
-        ).fetchone()
-        if not row:
-            return None
-        pid, created_at, used = row
-        if used:
-            return None
-        # TTL check.
-        try:
-            created_dt = datetime.fromisoformat(created_at)
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT practitioner_id, created_at, used FROM ws_tokens "
+                "WHERE token = %s",
+                (token,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            pid = row["practitioner_id"]
+            created_at = row["created_at"]
+            used = row["used"]
+            if used:
+                return None
+            # TTL check. created_at is a timezone-aware datetime from
+            # TIMESTAMPTZ; if it's somehow a string, parse it.
+            if isinstance(created_at, str):
+                try:
+                    created_dt = datetime.fromisoformat(created_at)
+                except (ValueError, TypeError):
+                    return None
+            else:
+                created_dt = created_at
+            # Ensure timezone-aware for comparison.
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
             age = (datetime.now(timezone.utc) - created_dt).total_seconds()
-        except (ValueError, TypeError):
-            return None
-        if age > WS_TOKEN_TTL:
-            conn.execute("DELETE FROM ws_tokens WHERE token = ?", (token,))
-            conn.commit()
-            return None
-        conn.execute(
-            "UPDATE ws_tokens SET used = 1 WHERE token = ?", (token,)
-        )
-        conn.commit()
-        return pid
-
-
-# ---------------------------------------------------------------------------
-# Async wrappers
-# ---------------------------------------------------------------------------
-async def save_message(
-    practitioner_id: int, patient_username: str, sender: str, body: str
-) -> dict:
-    return await asyncio.to_thread(
-        _save_message_sync, practitioner_id, patient_username, sender, body
-    )
-
-
-async def list_messages(
-    conversation_id: str, before_id: int | None = None, limit: int = 50
-) -> list[dict]:
-    return await asyncio.to_thread(
-        _list_messages_sync, conversation_id, before_id, limit
-    )
-
-
-async def mark_read(conversation_id: str, reader: str) -> int:
-    return await asyncio.to_thread(_mark_read_sync, conversation_id, reader)
-
-
-async def unread_count(conversation_id: str, reader: str) -> int:
-    return await asyncio.to_thread(_unread_count_sync, conversation_id, reader)
-
-
-async def list_conversations_for_practitioner(
-    practitioner_id: int,
-) -> list[dict]:
-    return await asyncio.to_thread(
-        _list_conversations_for_practitioner_sync, practitioner_id
-    )
-
-
-async def list_conversations_for_patient(
-    patient_username: str,
-) -> list[dict]:
-    return await asyncio.to_thread(
-        _list_conversations_for_patient_sync, patient_username
-    )
-
-
-async def create_ws_token(practitioner_id: int) -> tuple[str, int]:
-    return await asyncio.to_thread(_create_ws_token_sync, practitioner_id)
-
-
-async def consume_ws_token(token: str) -> int | None:
-    return await asyncio.to_thread(_consume_ws_token_sync, token)
+            if age > WS_TOKEN_TTL:
+                await cur.execute("DELETE FROM ws_tokens WHERE token = %s", (token,))
+                return None
+            await cur.execute(
+                "UPDATE ws_tokens SET used = TRUE WHERE token = %s", (token,)
+            )
+            return pid

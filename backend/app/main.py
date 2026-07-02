@@ -122,6 +122,9 @@ app.mount("/chat-ws", make_socketio_app())
 
 @app.on_event("startup")
 async def startup() -> None:
+    # Initialize the PostgreSQL connection pool before any DB operations.
+    from app.db import init_pool, close_pool
+    await init_pool()
     await init_db()
     # Run the plan migration: for each onboarded patient with no active plan,
     # create a default plan from the old 6 wellness domains and re-point logs.
@@ -132,6 +135,12 @@ async def startup() -> None:
     if os.getenv("SEED_ON_STARTUP", "true").lower() != "false":
         from app.seed import seed_demo_data
         await seed_demo_data()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    from app.db import close_pool
+    await close_pool()
 
 
 @app.get("/health")
