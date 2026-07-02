@@ -149,6 +149,11 @@ def _init_db_sync() -> None:
     from app.practitioner_db import _init_practitioner_db_sync
     _init_practitioner_db_sync()
 
+    # Initialize the tracking-plan tables (plans, metrics, outcomes, phases,
+    # drafts, suggestions) and add the metric_id column to daily_logs.
+    from app.plan_db import _init_plan_db_sync
+    _init_plan_db_sync()
+
 
 def _register_user_sync(username: str, password: str) -> bool:
     salt = _make_salt()
@@ -613,6 +618,17 @@ async def list_biomarkers_by_name(username: str, name: str) -> list[dict]:
 def _delete_user_cascade_sync(username: str) -> None:
     """Delete a user and ALL associated data across every table."""
     with _lock, sqlite3.connect(DB_PATH) as conn:
+        # Plan tables: delete child rows first, then plans/drafts/suggestions.
+        plan_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM plans WHERE patient_username = ?", (username,)
+        ).fetchall()]
+        for pid in plan_ids:
+            conn.execute("DELETE FROM plan_outcomes WHERE plan_id = ?", (pid,))
+            conn.execute("DELETE FROM plan_metrics WHERE plan_id = ?", (pid,))
+            conn.execute("DELETE FROM plan_phases WHERE plan_id = ?", (pid,))
+        conn.execute("DELETE FROM plans WHERE patient_username = ?", (username,))
+        conn.execute("DELETE FROM plan_drafts WHERE patient_username = ?", (username,))
+        conn.execute("DELETE FROM plan_suggestions WHERE patient_username = ?", (username,))
         conn.execute("DELETE FROM biomarkers WHERE username = ?", (username,))
         conn.execute("DELETE FROM daily_logs WHERE username = ?", (username,))
         conn.execute("DELETE FROM daily_schedules WHERE username = ?", (username,))

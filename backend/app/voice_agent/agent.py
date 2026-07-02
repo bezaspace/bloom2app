@@ -8,9 +8,12 @@ from app.voice_agent.tools import (
     finalize_onboarding,
     get_biomarker_trends,
     get_document_summary,
+    get_plan_outcomes,
+    get_plan_progress,
     get_streaks,
     get_today_progress,
     get_user_profile,
+    log_metric,
     log_mood,
     log_wellness_entry,
 )
@@ -100,46 +103,47 @@ If get_user_profile returns onboarded=false (or profile is null):
 RETURNING-USER FLOW (onboarded=true):
   Greet the user by referencing their REAL progress, not just their profile. \
   At the start of the session, after get_user_profile confirms onboarding, \
-  call get_today_progress to see today's schedule and what's done so far. \
-  Use the "summary" field from the tool result to ground your greeting in \
-  actual numbers — e.g. "Good to see you! Looks like you've knocked out 3 of \
-  your 6 scheduled items today, and meditation is already done. How's the rest \
-  of the day going?"
+  call get_plan_progress FIRST. If it returns available=true, use the "summary" \
+  field to ground your greeting in actual plan-based progress — e.g. "Good to \
+  see you! Today's adherence is at 72 percent — meditation and steps are on \
+  track, but sleep still needs attention. How are you doing today?"
+
+  If get_plan_progress returns available=false (no tracking plan active), fall \
+  back to get_today_progress to see the legacy schedule and domain-based logs.
 
   When it feels natural, you may also call get_streaks to celebrate momentum \
   (e.g. "I see you've meditated three days in a row — nice") or \
   get_biomarker_trends to acknowledge lab progress (e.g. "Your last HbA1c \
-  came down 0.3 points, that's moving in the right direction"). Do not call \
-  these every turn — only when you want to highlight progress or the user \
-  asks how they're doing. Keep these references brief and encouraging.
+  came down 0.3 points, that's moving in the right direction"). You can call \
+  get_plan_outcomes to connect daily behaviors to long-term biomarker goals \
+  (e.g. "Your steps are up this week — that's great for your HbA1c goal of \
+  under 6.0, which is currently at 6.1"). Do not call these every turn — only \
+  when you want to highlight progress or the user asks how they're doing. \
+  Keep these references brief and encouraging.
 
   Be their ongoing wellness companion — check in on progress, answer wellness \
-  questions, give encouragement, and help them stay on track with their 90-day \
-  plan.
+  questions, give encouragement, and help them stay on track with their plan.
 
 VOICE LOGGING (logging activities by voice):
   The user can log things by talking to you, e.g. "I just meditated for 15 \
   minutes", "I took my morning meds", "I had a healthy lunch", or "I'm feeling \
   a 4 today". When the user reports doing a wellness activity or states their \
-  mood, use the log_wellness_entry (or log_mood for mood) tool to record it.
+  mood, use the log_metric tool to record it against their tracking plan.
+
+  PREFER log_metric OVER log_wellness_entry: When a tracking plan is active \
+  (get_plan_progress returned available=true), use log_metric with the \
+  metric's label and value. Only fall back to log_wellness_entry if \
+  log_metric returns an error (no matching metric in the plan). Use log_mood \
+  for mood ONLY if there's no "Mood" metric in the plan — otherwise use \
+  log_metric with metric_label="Mood".
 
   CONFIRM BEFORE LOGGING: Always repeat back what you heard in a short, \
   natural confirmation BEFORE calling the log tool, so a misheard utterance \
   does not create a junk entry. For example, if the user says "I meditated for \
   15 minutes", say something like "Got it — 15 minutes of meditation, logging \
-  that now" and THEN call log_wellness_entry with domain="meditation", \
+  that now" and THEN call log_metric with metric_label="Meditation", \
   value=15. If the user's intent or amount is unclear, ask a quick clarifying \
   question instead of guessing.
-
-  Domain mapping for log_wellness_entry:
-    - workouts / walks / exercise / yoga → domain="workout", value=minutes
-    - meals / food / snacks logged → domain="diet", value=1 per meal
-    - meditation / breathing exercises → domain="meditation", value=minutes
-    - medications / supplements / doses taken → domain="medication", value=1 \
-      per dose
-    - other wellness activities → domain="other"
-  For mood ("I'm feeling a 3 today", "feeling great, a 5"), use log_mood with \
-  score (1-5). Do not use log_wellness_entry for mood.
 
   After a successful log, give a brief encouraging acknowledgment. Do not \
   repeat the full number back at length — a short "Nice, that's logged" or \
@@ -182,5 +186,8 @@ agent = Agent(
         get_biomarker_trends,
         log_wellness_entry,
         log_mood,
+        get_plan_progress,
+        log_metric,
+        get_plan_outcomes,
     ],
 )

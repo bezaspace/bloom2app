@@ -15,10 +15,17 @@ import {
   getDashboardToday,
   regenerateSchedule,
   saveDailyLog,
+  getPlan,
+  getTodayMetricLogs,
+  getAdherence,
+  getBiomarkerProgress,
+  logMetric,
   type DailySchedule,
   type DashboardToday,
   type LogEntry,
   type ScheduleItem,
+  type TrackingPlan,
+  type OutcomeProgress,
 } from "../dashboard";
 import { PlanSummaryCard } from "./dashboard/PlanSummaryCard";
 import { DailyScheduleCard } from "./dashboard/DailyScheduleCard";
@@ -26,6 +33,9 @@ import { WellnessDomainCard } from "./dashboard/WellnessDomainCard";
 import { MentalHealthCard } from "./dashboard/MentalHealthCard";
 import { BiomarkerSection } from "./dashboard/BiomarkerSection";
 import { EmptyState } from "./dashboard/EmptyState";
+import { MetricCard } from "./dashboard/MetricCard";
+import { PlanOverviewCard } from "./dashboard/PlanOverviewCard";
+import { InsightsCard } from "./dashboard/InsightsCard";
 
 interface DashboardScreenProps {
   /** Called when the user wants to switch to the Talk tab (e.g. to onboard). */
@@ -39,6 +49,11 @@ export function DashboardScreen({ onGoToTalk }: DashboardScreenProps) {
   const [regenerating, setRegenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [biomarkerCount, setBiomarkerCount] = useState(0);
+  // Tracking plan state.
+  const [plan, setPlan] = useState<TrackingPlan | null>(null);
+  const [metricLogs, setMetricLogs] = useState<Record<string, LogEntry[]>>({});
+  const [overallAdherence, setOverallAdherence] = useState<number | null>(null);
+  const [outcomes, setOutcomes] = useState<OutcomeProgress[]>([]);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -47,6 +62,17 @@ export function DashboardScreen({ onGoToTalk }: DashboardScreenProps) {
       setData(d);
       setBiomarkerCount(d.biomarker_count);
       setError(null);
+      // Fetch tracking plan + metric logs + adherence + outcomes in parallel.
+      const [p, ml, ad, oc] = await Promise.all([
+        getPlan().catch(() => null),
+        getTodayMetricLogs().catch(() => ({})),
+        getAdherence().catch(() => null),
+        getBiomarkerProgress().catch(() => []),
+      ]);
+      setPlan(p);
+      setMetricLogs(ml);
+      setOverallAdherence(ad?.overall ?? null);
+      setOutcomes(oc);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -204,6 +230,7 @@ export function DashboardScreen({ onGoToTalk }: DashboardScreenProps) {
 
   const schedule = data?.schedule ?? null;
   const targets = schedule?.daily_targets ?? {};
+  const hasPlan = plan !== null && plan.metrics.length > 0;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -253,8 +280,16 @@ export function DashboardScreen({ onGoToTalk }: DashboardScreenProps) {
           </View>
         ) : null}
 
-        {/* Plan summary */}
-        {data ? (
+        {/* Plan overview card (when a tracking plan is active) */}
+        {hasPlan && data ? (
+          <PlanOverviewCard
+            plan={plan!}
+            overallAdherence={overallAdherence}
+            outcomes={outcomes}
+            dayOfPlan={data.day_of_plan}
+          />
+        ) : data ? (
+          /* Legacy plan summary card (no tracking plan) */
           <PlanSummaryCard
             summary={data.plan_summary}
             phase={data.phase}
@@ -279,50 +314,72 @@ export function DashboardScreen({ onGoToTalk }: DashboardScreenProps) {
           />
         )}
 
-        {/* Wellness domain cards */}
-        <SectionHeader title="Today's Wellness" />
-        <WellnessDomainCard
-          domain="workout"
-          title="Workouts"
-          icon={"\u{1F3CB}"}
-          targetValue={targets.workout_minutes}
-          targetLabel="min"
-          todayEntries={data?.logs?.workout}
-          onQuickLog={(v) => void handleQuickLog("workout", v)}
-        />
-        <WellnessDomainCard
-          domain="diet"
-          title="Diet"
-          icon={"\u{1F969}"}
-          targetValue={targets.meals_logged}
-          targetLabel="meals"
-          todayEntries={data?.logs?.diet}
-          onQuickLog={() => void handleQuickLog("diet", 1)}
-        />
-        <WellnessDomainCard
-          domain="meditation"
-          title="Meditation"
-          icon={"\u{1F9D8}"}
-          targetValue={targets.meditation_minutes}
-          targetLabel="min"
-          todayEntries={data?.logs?.meditation}
-          onQuickLog={(v) => void handleQuickLog("meditation", v)}
-        />
-        <WellnessDomainCard
-          domain="medication"
-          title="Medication"
-          icon={"\u{1F48A}"}
-          targetValue={targets.meds_taken}
-          targetLabel="doses"
-          todayEntries={data?.logs?.medication}
-          onQuickLog={() => void handleQuickLog("medication", 1)}
-        />
+        {/* Plan-based metric cards (when a tracking plan is active) */}
+        {hasPlan ? (
+          <>
+            <SectionHeader title="Today's Metrics" />
+            {plan!.metrics
+              .filter((m) => m.is_active)
+              .map((m) => (
+                <MetricCard
+                  key={m.id}
+                  metric={m}
+                  todayEntries={metricLogs[String(m.id)]}
+                  onLogged={() => void load(true)}
+                />
+              ))}
+            {/* AI Insights */}
+            <SectionHeader title="AI Insights" />
+            <InsightsCard />
+          </>
+        ) : (
+          <>
+            {/* Legacy wellness domain cards (no tracking plan) */}
+            <SectionHeader title="Today's Wellness" />
+            <WellnessDomainCard
+              domain="workout"
+              title="Workouts"
+              icon={"\u{1F3CB}"}
+              targetValue={targets.workout_minutes}
+              targetLabel="min"
+              todayEntries={data?.logs?.workout}
+              onQuickLog={(v) => void handleQuickLog("workout", v)}
+            />
+            <WellnessDomainCard
+              domain="diet"
+              title="Diet"
+              icon={"\u{1F969}"}
+              targetValue={targets.meals_logged}
+              targetLabel="meals"
+              todayEntries={data?.logs?.diet}
+              onQuickLog={() => void handleQuickLog("diet", 1)}
+            />
+            <WellnessDomainCard
+              domain="meditation"
+              title="Meditation"
+              icon={"\u{1F9D8}"}
+              targetValue={targets.meditation_minutes}
+              targetLabel="min"
+              todayEntries={data?.logs?.meditation}
+              onQuickLog={(v) => void handleQuickLog("meditation", v)}
+            />
+            <WellnessDomainCard
+              domain="medication"
+              title="Medication"
+              icon={"\u{1F48A}"}
+              targetValue={targets.meds_taken}
+              targetLabel="doses"
+              todayEntries={data?.logs?.medication}
+              onQuickLog={() => void handleQuickLog("medication", 1)}
+            />
 
-        {/* Mental health (special card with mood check-in) */}
-        <MentalHealthCard
-          todayEntries={data?.logs?.mental_health}
-          onLogMood={handleLogMood}
-        />
+            {/* Mental health (special card with mood check-in) */}
+            <MentalHealthCard
+              todayEntries={data?.logs?.mental_health}
+              onLogMood={handleLogMood}
+            />
+          </>
+        )}
 
         {/* Biomarkers (the centerpiece) */}
         <SectionHeader title="Biomarkers" />

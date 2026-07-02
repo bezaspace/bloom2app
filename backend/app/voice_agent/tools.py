@@ -4,7 +4,7 @@ These are ADK FunctionTools that the live agent calls during the voice
 conversation. ADK's ``run_live()`` executes them automatically when the model
 emits a function-call.
 
-Two groups:
+Three groups:
 
 1. **Onboarding tools** — read/write the per-user onboarding profile, plan, and
    document summary. Used during the first session.
@@ -12,6 +12,10 @@ Two groups:
    write voice-logged entries to ``daily_logs``. These bridge the voice agent
    and the dashboard so Bloom can speak about real progress and accept logs by
    voice.
+3. **Plan-aware tools** — ``log_metric`` and ``get_plan_progress`` read from
+   the practitioner-designed tracking plan (plan_metrics) and write
+   metric_id-keyed logs. These are the primary tools when a tracking plan is
+   active; the legacy domain-based tools are kept for backward compatibility.
 
 The username is injected into the session state as ``"username"`` by the
 WebSocket handler in ``main.py`` at session creation time, so the tools can
@@ -39,6 +43,13 @@ from app.database import (
     save_profile,
 )
 from app.dashboard.schemas import WELLNESS_DOMAINS
+from app.plan_db import (
+    get_active_plan,
+    get_metric,
+    get_metric_logs,
+    save_metric_log,
+)
+from app.plan_analytics import compute_adherence_for_date
 
 logger = logging.getLogger("bloom2.tools")
 
@@ -496,3 +507,221 @@ async def log_mood(
         "message": f"Logged mood {score}/5 for {iso_date}.",
         "summary": f"Logged mood {score}/5 for {iso_date}.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Plan-aware tools (primary when a tracking plan is active)
+# ---------------------------------------------------------------------------
+async def get_plan_progress(tool_context: ToolContext) -> dict:
+    """Returns a compact summary of the user's progress against their
+    practitioner-designed tracking plan for today.
+
+    Call this at the start of a session (after get_user_profile confirms
+    onboarding) to greet the user with real plan-based progress: which
+    metrics are on track, which need attention, and how today's adherence
+    is looking. The ``summary`` field is a ready-to-speak sentence.
+
+    Returns:
+        dict with: available (bool), plan_title, phase, metrics (list of
+        {label, unit, target, actual, adherence, on_track}), overall_adherence,
+        and a summary string. Returns {"available": false} if no tracking plan
+        is active.
+    """
+    username = tool_context.state.get("username")
+    if not username:
+        return {"available": False, "summary": "No authenticated user."}
+
+    plan = await get_active_plan(username)
+    if not plan:
+        return {"available": False, "summary": "No tracking plan active."}
+
+    iso_date = _today_iso()
+    adherence = await compute_adherence_for_date(username, iso_date)
+    metrics_out = []
+    for m in adherence.get("metrics", []):
+        on_track = m.get("adherence") is not None and m["adherence"] >= 0.8
+        metrics_out.append({
+            "label": m["label"],
+            "unit": m["unit"],
+            "target": m.get("target"),
+            "actual": m.get("actual"),
+            "adherence": m.get("adherence"),
+            "on_track": on_track,
+        })
+    overall = adherence.get("overall")
+    # Build a speakable summary.
+    bits = []
+    on_track_count = sum(1 for m in metrics_out if m["on_track"])
+    needs_attention = [m for m in metrics_out if m["actual"] is not None and not m["on_track"]]
+    not_logged = [m for m in metrics_out if m["actual"] is None]
+    if overall is not None:
+        bits.append(f"Today's adherence is {int(overall * 100)} percent")
+    if on_track_count:
+        bits.append(f"{on_track_count} metric{'s' if on_track_count != 1 else ''} on track")
+    if needs_attention:
+        labels = ", ".join(m["label"] for m in needs_attention[:3])
+        bits.append(f"needs attention: {labels}")
+    if not_logged:
+        labels = ", ".join(m["label"] for m in not_logged[:3])
+        bits.append(f"not yet logged: {labels}")
+    summary = ". ".join(bits) + "." if bits else "Nothing logged yet today."
+    # Include plan outcomes for the agent to reference.
+    outcomes = [
+        {
+            "biomarker_name": o["biomarker_name"],
+            "target_value": o["target_value"],
+            "target_direction": o["target_direction"],
+            "unit": o["unit"],
+            "current_value": o.get("current_value"),
+        }
+        for o in plan.get("outcomes", [])
+    ]
+    return {
+        "available": True,
+        "plan_title": plan.get("title"),
+        "phase": adherence.get("plan_title", ""),
+        "date": iso_date,
+        "metrics": metrics_out,
+        "outcomes": outcomes,
+        "overall_adherence": overall,
+        "summary": summary,
+    }
+
+
+async def log_metric(
+    metric_label: str,
+    value: float | None = None,
+    note: str | None = None,
+    completed: bool = True,
+    date: str | None = None,
+    tool_context: ToolContext = None,
+) -> dict:
+    """Logs a metric value by voice, matched against the user's active tracking
+    plan by label.
+
+    This is the primary logging tool when a tracking plan is active. It finds
+    the metric in the user's plan by matching the label (case-insensitive,
+    partial match OK), appends an entry to that metric's log for the date
+    (default today), and returns a speakable confirmation. The entry is tagged
+    with note "via voice" so the dashboard can badge it.
+
+    ALWAYS confirm with the user in speech BEFORE calling this tool (e.g.
+    "Got it — 15 minutes of meditation, logging that now") so a misheard
+    utterance does not create a junk entry.
+
+    Args:
+        metric_label: The metric's display label (e.g. "Meditation", "Steps",
+            "Mood", "Sleep Duration"). Must match a metric in the user's
+            active plan. Use get_plan_progress first to see available metrics.
+        value: The quantitative value (e.g. 15 for 15 minutes, 8000 for steps,
+            4 for mood on a 1-5 scale). Omit for a simple check-off.
+        note: Optional free-text note. If omitted, "via voice" is used.
+        completed: Whether the activity was completed (default true).
+        date: ISO date (YYYY-MM-DD) the log is for. Defaults to today.
+
+    Returns:
+        dict with: status ("success"|"error"), message, and a summary string.
+    """
+    username = tool_context.state.get("username")
+    if not username:
+        return {"status": "error", "message": "No authenticated user in session."}
+
+    plan = await get_active_plan(username)
+    if not plan:
+        return {"status": "error", "message": "No active tracking plan. Use log_wellness_entry instead."}
+
+    # Find the metric by label (case-insensitive, partial match).
+    label_lower = metric_label.lower().strip()
+    metric = None
+    for m in plan["metrics"]:
+        if not m.get("is_active", True):
+            continue
+        if m["label"].lower() == label_lower:
+            metric = m
+            break
+    if not metric:
+        # Try partial match.
+        for m in plan["metrics"]:
+            if not m.get("is_active", True):
+                continue
+            if label_lower in m["label"].lower() or m["label"].lower() in label_lower:
+                metric = m
+                break
+    if not metric:
+        available = ", ".join(m["label"] for m in plan["metrics"] if m.get("is_active", True))
+        return {
+            "status": "error",
+            "message": f"No metric matching '{metric_label}'. Available: {available}.",
+            "summary": f"I couldn't find a metric called {metric_label} in your plan.",
+        }
+
+    iso_date = date or _today_iso()
+    # Read existing entries for this metric/date so we append rather than wipe.
+    all_logs = await get_metric_logs(username, iso_date)
+    existing = list(all_logs.get(metric["id"], []))
+
+    entry = {
+        "key": f"voice_{int(time.time() * 1000)}",
+        "completed": completed,
+        "value": value,
+        "note": note if note is not None else "via voice",
+        "metric_id": metric["id"],
+    }
+    existing.append(entry)
+    await save_metric_log(username, iso_date, metric["id"], json.dumps(existing))
+
+    val_str = f" ({value} {metric.get('unit', '')})" if value is not None else ""
+    logger.info("Voice metric log for %s: %s%s on %s", username, metric["label"], val_str, iso_date)
+    return {
+        "status": "success",
+        "message": f"Logged {metric['label']}{val_str} for {iso_date}.",
+        "summary": f"Logged {metric['label']}{val_str} for {iso_date}.",
+        "metric_label": metric["label"],
+        "metric_id": metric["id"],
+    }
+
+
+async def get_plan_outcomes(tool_context: ToolContext) -> dict:
+    """Returns the outcome targets from the user's tracking plan (biomarker
+    goals like "HbA1c below 6.0") plus current values.
+
+    Use this to connect the user's daily behaviors to their long-term outcomes,
+    e.g. "Your steps are up 12% this week — that's great for your HbA1c goal
+    of under 6.0, which is currently at 6.1."
+
+    Returns:
+        dict with: available (bool), outcomes (list of {biomarker_name, target,
+        direction, unit, current, on_track}), and a summary string.
+    """
+    username = tool_context.state.get("username")
+    if not username:
+        return {"available": False, "summary": "No authenticated user."}
+
+    plan = await get_active_plan(username)
+    if not plan or not plan.get("outcomes"):
+        return {"available": False, "summary": "No outcome targets in your plan."}
+
+    from app.plan_analytics import compute_biomarker_progress
+    progress = await compute_biomarker_progress(username)
+    out = []
+    for o in progress.get("outcomes", []):
+        out.append({
+            "biomarker_name": o["biomarker_name"],
+            "target": o["target_value"],
+            "direction": o["target_direction"],
+            "unit": o["unit"],
+            "current": o.get("current_value"),
+            "on_track": o.get("on_track"),
+            "delta": o.get("delta"),
+        })
+    # Build a speakable summary.
+    bits = []
+    for o in out:
+        if o["current"] is not None:
+            arrow = "below" if o["direction"] == "below" else "above"
+            status = "on track" if o["on_track"] else "not yet at target"
+            bits.append(f"{o['biomarker_name']} at {o['current']} {o['unit']}, target {arrow} {o['target']}, {status}")
+        else:
+            bits.append(f"{o['biomarker_name']} target {o['target']} {o['unit']}, no current reading")
+    summary = ". ".join(bits) + "." if bits else "No outcome progress to report."
+    return {"available": True, "outcomes": out, "summary": summary}

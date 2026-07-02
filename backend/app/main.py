@@ -42,6 +42,7 @@ from app.auth import router as auth_router
 from app.practitioner_auth import router as practitioner_auth_router
 from app.practitioner_routes import router as practitioner_router
 from app.patient_practitioner_routes import router as patient_practitioner_router
+from app.plan_routes import router as plan_router
 from app.database import (
     add_biomarkers,
     add_doc_record,
@@ -105,11 +106,16 @@ app.include_router(auth_router)
 app.include_router(practitioner_auth_router)
 app.include_router(practitioner_router)
 app.include_router(patient_practitioner_router)
+app.include_router(plan_router)
 
 
 @app.on_event("startup")
 async def startup() -> None:
     await init_db()
+    # Run the plan migration: for each onboarded patient with no active plan,
+    # create a default plan from the old 6 wellness domains and re-point logs.
+    from app.plan_db import run_plan_migration
+    await run_plan_migration()
     # Auto-seed demo data on first run (when the DB has no onboarded demo user).
     # Set SEED_ON_STARTUP=false in .env to disable.
     if os.getenv("SEED_ON_STARTUP", "true").lower() != "false":
@@ -255,6 +261,11 @@ async def dashboard_today(user: str = Depends(get_current_user)) -> dict:
     doc_summary = profile_data.get("doc_summary")
     onboarded_at = profile_data.get("onboarded_at")
 
+    # Fetch the active tracking plan (if any) so the schedule can be built
+    # from the practitioner-designed metrics instead of hardcoded domains.
+    from app.plan_db import get_active_plan
+    tracking_plan = await get_active_plan(user)
+
     # Generate (or fetch cached) today's schedule.
     iso_date = _today_iso()
     schedule_dict = await get_daily_schedule(user, iso_date)
@@ -265,6 +276,7 @@ async def dashboard_today(user: str = Depends(get_current_user)) -> dict:
             doc_summary=doc_summary,
             onboarded_at=onboarded_at,
             target_date=iso_date,
+            tracking_plan=tracking_plan,
         )
         schedule_dict = schedule.model_dump()
         await save_daily_schedule(user, iso_date, json.dumps(schedule_dict))
@@ -314,12 +326,17 @@ async def dashboard_regenerate_schedule(
     doc_summary = profile_data.get("doc_summary")
     onboarded_at = profile_data.get("onboarded_at")
 
+    # Fetch the active tracking plan so regeneration respects it.
+    from app.plan_db import get_active_plan
+    tracking_plan = await get_active_plan(user)
+
     schedule = await generate_daily_schedule(
         profile=profile,
         plan=plan,
         doc_summary=doc_summary,
         onboarded_at=onboarded_at,
         target_date=iso_date,
+        tracking_plan=tracking_plan,
     )
     schedule_dict = schedule.model_dump()
     await save_daily_schedule(user, iso_date, json.dumps(schedule_dict))

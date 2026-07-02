@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Sparkles, MessageSquare, Plus } from "lucide-react";
+import { Sparkles, MessageSquare, Plus, ClipboardList, BarChart3 } from "lucide-react";
 import type { AISummary, PractitionerNote } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -167,6 +167,36 @@ export function ChatLink({ username }: { username: string }) {
     >
       <MessageSquare className="h-4 w-4" />
       Ask AI about this patient
+    </Link>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Plan Designer link
+// ---------------------------------------------------------------------------
+export function PlanDesignerLink({ username }: { username: string }) {
+  return (
+    <Link
+      href={`/patients/${encodeURIComponent(username)}/plan`}
+      className="flex items-center justify-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-4 text-sm font-medium text-emerald-300 transition hover:bg-emerald-950/40"
+    >
+      <ClipboardList className="h-4 w-4" />
+      Design Tracking Plan
+    </Link>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Analytics link
+// ---------------------------------------------------------------------------
+export function AnalyticsLink({ username }: { username: string }) {
+  return (
+    <Link
+      href={`/patients/${encodeURIComponent(username)}/analytics`}
+      className="flex items-center justify-center gap-2 rounded-xl border border-sky-500/30 bg-sky-950/20 p-4 text-sm font-medium text-sky-300 transition hover:bg-sky-950/40"
+    >
+      <BarChart3 className="h-4 w-4" />
+      View Analytics
     </Link>
   );
 }

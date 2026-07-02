@@ -642,12 +642,233 @@ async def seed_demo_data(force: bool = False) -> bool:
     await add_biomarkers(DEMO_USERNAME, readings)
     logger.info("Seed: saved %d biomarker readings (4 markers).", len(readings))
 
+    # Create a practitioner-designed tracking plan for the demo patient.
+    await _seed_demo_tracking_plan()
+
     logger.info("Seed: complete. Log in with %s / %s", DEMO_USERNAME, DEMO_PASSWORD)
 
     # Also seed demo practitioners + a demo appointment.
     await seed_demo_practitioners(force=force)
 
     return True
+
+
+async def _seed_demo_tracking_plan() -> None:
+    """Create a practitioner-designed tracking plan for the demo patient.
+
+    Designed by Dr. Anya Sharma (endocrinologist) based on the demo patient's
+    biomarkers (borderline HbA1c, mild hypertension, low vitamin D) and
+    profile (sleep/stress goals). Includes:
+      - 3 outcome targets (HbA1c < 5.6, LDL < 100, Vitamin D >= 30)
+      - 6 tracked metrics (steps, sleep, meditation, mood, BP, medication)
+      - 3 phases (30 days each)
+    Re-points the existing daily logs to the new metric IDs.
+    """
+    from app.plan_db import (
+        _has_active_plan_sync,
+        _create_plan_sync,
+        _migrate_domain_logs_for_patient_sync,
+    )
+    from app.metric_templates import DOMAIN_TO_TEMPLATE
+
+    if _has_active_plan_sync(DEMO_USERNAME):
+        logger.info("Seed: demo patient already has an active plan — skipping plan creation.")
+        return
+
+    # Look up Dr. Anya Sharma's practitioner ID.
+    dr_anya = await get_practitioner_by_username("dranya")
+    practitioner_id = dr_anya["id"] if dr_anya else None
+
+    outcomes = [
+        {
+            "biomarker_name": "HbA1c",
+            "target_value": 5.6,
+            "target_direction": "below",
+            "target_high": None,
+            "unit": "%",
+            "target_date": (date.today() + timedelta(days=76)).isoformat(),  # ~90 days out
+            "current_value": 5.8,
+            "current_as_of": (date.today() - timedelta(days=10)).isoformat(),
+        },
+        {
+            "biomarker_name": "LDL Cholesterol",
+            "target_value": 100,
+            "target_direction": "below",
+            "target_high": None,
+            "unit": "mg/dL",
+            "target_date": (date.today() + timedelta(days=76)).isoformat(),
+            "current_value": 122,
+            "current_as_of": (date.today() - timedelta(days=10)).isoformat(),
+        },
+        {
+            "biomarker_name": "Vitamin D (25-OH)",
+            "target_value": 30,
+            "target_direction": "above",
+            "target_high": None,
+            "unit": "ng/mL",
+            "target_date": (date.today() + timedelta(days=76)).isoformat(),
+            "current_value": 28,
+            "current_as_of": (date.today() - timedelta(days=10)).isoformat(),
+        },
+    ]
+
+    metrics = [
+        {
+            "template_id": "steps",
+            "label": "Steps",
+            "unit": "steps",
+            "frequency": "daily",
+            "time_of_day": "evening",
+            "target_type": "minimum",
+            "target_value": 8000,
+            "target_high": None,
+            "is_active": True,
+            "phase": None,
+            "sort_order": 0,
+        },
+        {
+            "template_id": "sleep_duration",
+            "label": "Sleep Duration",
+            "unit": "hours",
+            "frequency": "daily",
+            "time_of_day": "morning",
+            "target_type": "minimum",
+            "target_value": 7,
+            "target_high": None,
+            "is_active": True,
+            "phase": None,
+            "sort_order": 1,
+        },
+        {
+            "template_id": "meditation_minutes",
+            "label": "Meditation",
+            "unit": "minutes",
+            "frequency": "daily",
+            "time_of_day": "morning",
+            "target_type": "minimum",
+            "target_value": 15,
+            "target_high": None,
+            "is_active": True,
+            "phase": None,
+            "sort_order": 2,
+        },
+        {
+            "template_id": "mood",
+            "label": "Mood",
+            "unit": "/5",
+            "frequency": "daily",
+            "time_of_day": "evening",
+            "target_type": "minimum",
+            "target_value": 3,
+            "target_high": None,
+            "is_active": True,
+            "phase": None,
+            "sort_order": 3,
+        },
+        {
+            "template_id": "blood_pressure_systolic",
+            "label": "Blood Pressure (Systolic)",
+            "unit": "mmHg",
+            "frequency": "daily",
+            "time_of_day": "morning",
+            "target_type": "maximum",
+            "target_value": 120,
+            "target_high": None,
+            "is_active": True,
+            "phase": None,
+            "sort_order": 4,
+        },
+        {
+            "template_id": "medication_adherence",
+            "label": "Lisinopril Taken",
+            "unit": "doses",
+            "frequency": "daily",
+            "time_of_day": "morning",
+            "target_type": "count",
+            "target_value": 1,
+            "target_high": None,
+            "is_active": True,
+            "phase": None,
+            "sort_order": 5,
+        },
+    ]
+
+    phases = [
+        {
+            "phase_number": 1,
+            "name": "Phase 1: Days 1-30",
+            "focus": "Build a daily meditation habit and establish a consistent sleep schedule.",
+            "actions": [
+                "Meditate 10 minutes every morning",
+                "Walk 20 minutes 3x per week",
+                "Lights out by 10:30pm",
+                "Take lisinopril each morning with breakfast",
+            ],
+            "day_start": 1,
+            "day_end": 30,
+        },
+        {
+            "phase_number": 2,
+            "name": "Phase 2: Days 31-60",
+            "focus": "Increase activity and introduce breathwork for stress.",
+            "actions": [
+                "Meditate 15 minutes daily",
+                "Walk 30 minutes 4x per week",
+                "Add 5-min breathwork after lunch",
+                "Track sleep in a journal",
+            ],
+            "day_start": 31,
+            "day_end": 60,
+        },
+        {
+            "phase_number": 3,
+            "name": "Phase 3: Days 61-90",
+            "focus": "Solidify habits and add variety.",
+            "actions": [
+                "Meditate 20 minutes daily",
+                "Try yoga 2x per week",
+                "Review sleep and mood trends",
+                "Plan the next 90 days",
+            ],
+            "day_start": 61,
+            "day_end": 90,
+        },
+    ]
+
+    plan = _create_plan_sync(
+        patient_username=DEMO_USERNAME,
+        practitioner_id=practitioner_id,
+        title="Metabolic Health & Sleep Optimization — 90 Days",
+        rationale=(
+            "Designed by Dr. Anya Sharma based on recent labs showing borderline "
+            "HbA1c (5.8%), elevated LDL (122 mg/dL), and low vitamin D (28 ng/mL). "
+            "Plan targets the behavioral levers most impactful for metabolic health: "
+            "daily activity (steps), sleep quality, stress reduction (meditation), "
+            "and medication adherence (lisinopril for BP). Mood tracked as a leading "
+            "indicator of adherence. Outcomes: HbA1c < 5.6%, LDL < 100, Vitamin D >= 30."
+        ),
+        outcomes=outcomes,
+        metrics=metrics,
+        phases=phases,
+    )
+    logger.info(
+        "Seed: created tracking plan '%s' with %d metrics, %d outcomes, %d phases.",
+        plan["title"], len(plan["metrics"]), len(plan["outcomes"]), len(plan["phases"]),
+    )
+
+    # Re-point existing daily logs to the new metric IDs.
+    metric_id_by_template: dict[str, int] = {}
+    for m in plan["metrics"]:
+        metric_id_by_template[m["template_id"]] = m["id"]
+    import sqlite3
+    from app.database import DB_PATH, _lock
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        updated = _migrate_domain_logs_for_patient_sync(
+            conn, DEMO_USERNAME, plan["id"], metric_id_by_template
+        )
+        conn.commit()
+    if updated:
+        logger.info("Seed: re-pointed %d daily log rows to new metric IDs.", updated)
 
 
 async def check_seed_status() -> None:

@@ -138,3 +138,198 @@ export interface AISummary {
   notable_items: string[];
   generated_for_date: string;
 }
+
+// ---------------------------------------------------------------------------
+// Tracking plan types (mirrors backend/app/plan_db.py)
+// ---------------------------------------------------------------------------
+export interface PlanMetric {
+  id: number;
+  plan_id: number;
+  template_id: string;
+  label: string;
+  unit: string;
+  frequency: string;
+  time_of_day: string | null;
+  target_type: string;
+  target_value: number | null;
+  target_high: number | null;
+  is_active: boolean;
+  phase: number | null;
+  sort_order: number;
+}
+
+export interface PlanOutcome {
+  id: number;
+  plan_id: number;
+  biomarker_name: string;
+  target_value: number;
+  target_direction: string;
+  target_high: number | null;
+  unit: string;
+  target_date: string | null;
+  current_value: number | null;
+  current_as_of: string | null;
+}
+
+export interface PlanPhase {
+  id: number;
+  plan_id: number;
+  phase_number: number;
+  name: string;
+  focus: string | null;
+  actions: string[];
+  day_start: number;
+  day_end: number;
+}
+
+export interface TrackingPlan {
+  id: number;
+  patient_username: string;
+  practitioner_id: number | null;
+  version: number;
+  is_active: boolean;
+  title: string | null;
+  rationale: string | null;
+  created_at: string;
+  updated_at: string;
+  outcomes: PlanOutcome[];
+  metrics: PlanMetric[];
+  phases: PlanPhase[];
+}
+
+export interface PlanDraft {
+  id: number;
+  patient_username: string;
+  practitioner_id: number | null;
+  status: "draft" | "published" | "archived";
+  draft_data: TrackingPlan;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MetricTemplate {
+  template_id: string;
+  label: string;
+  category: string;
+  unit: string;
+  default_target_type: string;
+  default_target_value: number | null;
+  default_frequency: string;
+  description: string;
+}
+
+export interface AdherenceMetric {
+  metric_id: number;
+  label: string;
+  template_id: string;
+  unit: string;
+  frequency: string;
+  target_type: string;
+  target: number | null;
+  target_high: number | null;
+  actual: number | null;
+  adherence: number | null;
+  phase: number | null;
+}
+
+export interface AdherenceResponse {
+  status: string;
+  date: string;
+  plan_id?: number;
+  plan_title?: string | null;
+  metrics: AdherenceMetric[];
+  overall?: number | null;
+}
+
+export interface AdherenceSummaryMetric {
+  metric_id: number;
+  label: string;
+  template_id: string;
+  unit: string;
+  target_type: string;
+  target: number | null;
+  adherence_avg: number | null;
+  days_with_data: number;
+}
+
+export interface AdherenceSummaryResponse {
+  status: string;
+  days: number;
+  metrics: AdherenceSummaryMetric[];
+  overall?: number | null;
+}
+
+export interface TrendEntry {
+  metric_id: number;
+  label: string;
+  template_id: string;
+  unit: string;
+  direction: "up" | "down" | "steady" | "unknown";
+  magnitude: number | null;
+  recent_avg: number | null;
+  prior_avg: number | null;
+  slope: number | null;
+  n_points: number;
+}
+
+export interface TrendsResponse {
+  status: string;
+  days: number;
+  trends: TrendEntry[];
+}
+
+export interface OutcomeProgress {
+  biomarker_name: string;
+  target_value: number;
+  target_direction: string;
+  target_high: number | null;
+  unit: string;
+  target_date: string | null;
+  current_value: number | null;
+  current_as_of: string | null;
+  prior_value: number | null;
+  delta: number | null;
+  on_track: boolean | null;
+  n_readings: number;
+}
+
+export interface BiomarkerProgressResponse {
+  status: string;
+  outcomes: OutcomeProgress[];
+}
+
+export interface DesignAgentMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+export interface DesignAgentResponse {
+  status: string;
+  reply: string;
+  draft: TrackingPlan | null;
+  draft_id: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Plan suggestions (AI-proposed adjustments for practitioner approval)
+// ---------------------------------------------------------------------------
+export interface PlanSuggestion {
+  id: number;
+  patient_username: string;
+  practitioner_id: number | null;
+  source: string;
+  suggestion: {
+    type?: string;
+    title?: string;
+    description?: string;
+    rationale?: string;
+    metric?: Partial<PlanMetric>;
+    outcome?: Partial<PlanOutcome>;
+    action?: string;
+    [key: string]: unknown;
+  };
+  status: "pending" | "approved" | "dismissed";
+  created_at: string;
+  decided_at: string | null;
+  decided_by: number | null;
+}

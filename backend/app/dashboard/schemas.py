@@ -40,10 +40,21 @@ class ScheduleItem(BaseModel):
     )
     title: str = Field(..., description="Short human-readable title, e.g. 'Morning walk'.")
     domain: str = Field(
-        ...,
+        default="other",
         description=(
             "Wellness domain this item belongs to. One of: "
-            "workout, diet, medication, mental_health, meditation, other."
+            "workout, diet, medication, mental_health, meditation, other. "
+            "Deprecated — kept for backward compatibility; metric_id is the "
+            "primary reference going forward."
+        ),
+    )
+    metric_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "ID of the plan_metric this schedule item corresponds to. "
+            "Set when the schedule is generated from a practitioner-designed "
+            "tracking plan. When present, this is the primary key for matching "
+            "logs to schedule items."
         ),
     )
     duration_min: Optional[int] = Field(
@@ -165,6 +176,13 @@ class LogEntry(BaseModel):
         description="Quantitative actual value, e.g. minutes meditated or calories eaten.",
     )
     note: Optional[str] = Field(default=None, description="Optional free-text note.")
+    metric_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "ID of the plan_metric this log entry corresponds to. Set when "
+            "logging against a practitioner-designed tracking plan."
+        ),
+    )
 
 
 class DailyLogRequest(BaseModel):
