@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Sparkles, MessageSquare, Plus, ClipboardList, BarChart3 } from "lucide-react";
+import { Sparkles, MessageSquare, Plus, ClipboardList, BarChart3, MessagesSquare } from "lucide-react";
 import type { AISummary, PractitionerNote } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ export function NotesPanel({
 }
 
 // ---------------------------------------------------------------------------
-// Chat link
+// Chat link (AI Q&A about the patient — stateless, practitioner asks AI)
 // ---------------------------------------------------------------------------
 export function ChatLink({ username }: { username: string }) {
   return (
@@ -167,6 +167,21 @@ export function ChatLink({ username }: { username: string }) {
     >
       <MessageSquare className="h-4 w-4" />
       Ask AI about this patient
+    </Link>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Direct message link (real-time text chat with the patient)
+// ---------------------------------------------------------------------------
+export function MessagePatientLink({ username }: { username: string }) {
+  return (
+    <Link
+      href={`/patients/${encodeURIComponent(username)}/messages`}
+      className="flex items-center justify-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-4 text-sm font-medium text-emerald-300 transition hover:bg-emerald-950/40"
+    >
+      <MessagesSquare className="h-4 w-4" />
+      Message {username}
     </Link>
   );
 }

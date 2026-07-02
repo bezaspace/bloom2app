@@ -333,3 +333,25 @@ export interface PlanSuggestion {
   decided_at: string | null;
   decided_by: number | null;
 }
+
+// ---------------------------------------------------------------------------
+// Chat types (mirrors backend/app/chat_db.py + chat_routes.py)
+// ---------------------------------------------------------------------------
+export interface ChatMessage {
+  id: number;
+  conversation_id: string;
+  practitioner_id: number;
+  patient_username: string;
+  sender: "patient" | "practitioner";
+  body: string;
+  created_at: string;
+  read_at: string | null;
+}
+
+export interface PractitionerConversation {
+  patient_username: string;
+  practitioner_id: number;
+  conversation_id: string;
+  last_message: ChatMessage | null;
+  unread_count: number;
+}

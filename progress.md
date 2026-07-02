@@ -190,3 +190,98 @@ patient see how daily behaviors move long-term outcomes.
 - Existing domain logs are re-pointed to the new metric IDs on seed.
 - `--force` re-seeds the plan (idempotent check via `_has_active_plan_sync`).
 
+## 9. Patient ↔ Practitioner Real-Time Text Chat
+
+WhatsApp-style 1:1 text messaging between a patient and their connected
+practitioner. Both sides see a chat thread with message bubbles, send
+messages in real time, load conversation history on open, and get typing
+indicators + read receipts. Messages persist in SQLite.
+
+### Transport: Socket.io on FastAPI
+- One `python-socketio` **AsyncServer** mounted on the FastAPI app at
+  `/chat-ws` (served at `/chat-ws/socket.io/`). Both clients connect to it
+  directly.
+- **Patient mobile app** authenticates with its bearer token in the socket
+  handshake `auth` payload.
+- **Practitioner web app** keeps the BFF for all REST calls. For the socket,
+  a new BFF route handler `POST /api/auth/ws-token` mints a short-lived,
+  single-use WS token (60s TTL) via `POST /practitioner/ws-token`. The
+  browser uses that token for the socket handshake — the long-lived bearer
+  never reaches browser JS.
+- Rooms: one per conversation (`f"{practitioner_id}:{patient_username}"`).
+  On connect, the socket joins every room for which the user has an active
+  connection.
+- Auto-reconnect with backoff; polling fallback if WebSockets are blocked.
+
+### Data model (`chat_db.py`)
+- **`chat_messages`** — id, conversation_id, practitioner_id,
+  patient_username, sender (`patient`|`practitioner`), body, created_at,
+  read_at. Indexed on (conversation_id, id) for pagination.
+- **`ws_tokens`** — short-lived single-use tokens for practitioner socket
+  auth (token, practitioner_id, created_at, used). TTL 60s.
+- Conversation list queries return last message preview + unread count.
+- Migration runs automatically on startup (`_init_chat_db_sync`).
+
+### Backend API (`chat_routes.py`)
+- **Patient-facing** (`/chat`): `GET /conversations`,
+  `GET /conversations/{practitioner_id}/messages` (cursor pagination via
+  `before` param), `POST .../messages` (send, REST fallback),
+  `POST .../read` (mark read).
+- **Practitioner-facing** (`/practitioner/chat`): same shape, keyed by
+  patient username.
+- All endpoints verify an active `practitioner_patient_connections` row.
+- Sending via REST also emits over the socket for real-time delivery.
+
+### Socket events (`chat_socket.py`)
+- `message` (client→server): persist + broadcast to room.
+- `typing` (client→server): broadcast typing indicator (not persisted).
+- `message_read` (client→server): mark other party's messages read + emit
+  `read` to room.
+- `message` / `typing` / `read` (server→client): the live events.
+
+### Mobile app (`frontend/src/`)
+- **`chat.ts`** — API client: `listConversations`, `getMessages`,
+  `sendMessage`, `markConversationRead` + `ChatMessage` / `Conversation`
+  types.
+- **`useChatSocket.ts`** — React hook managing the Socket.io connection:
+  connection status, `sendMessage`, `sendTyping`, `markRead`, `onMessage`,
+  `onTyping`, `onRead` callbacks.
+- **`ChatScreen.tsx`** — two views: conversation list (inbox with unread
+  badges, last message preview, avatar) + WhatsApp-style thread (message
+  bubbles left/right, auto-scroll, load-older on scroll-up, typing
+  indicator, read receipts ✓/✓✓, optimistic send, keyboard-aware input
+  bar).
+- **`MainTabs.tsx`** — new 4th bottom tab "Messages" (💬).
+
+### Practitioner web app (`practitioner/src/`)
+- **`/api/auth/ws-token/route.ts`** — BFF route that mints the short-lived
+  WS token (forwards to `/practitioner/ws-token` with the bearer from the
+  httpOnly cookie).
+- **`/messages`** — inbox page: lists all connected patients with last
+  message preview, timestamp, unread badge. Patients without messages yet
+  show a "Start a conversation" prompt.
+- **`/patients/[username]/messages`** — thread page: renders
+  `MessageThread` (full-height WhatsApp-style chat with bubbles, typing
+  indicator, read receipts, load-older, optimistic send).
+- **`MessageThread.tsx`** — `"use client"` component: fetches history via
+  BFF proxy, connects to FastAPI Socket.io with the short-lived WS token,
+  sends via socket + REST fallback.
+- **Sidebar** — new "Messages" nav item (MessageSquare icon).
+- **Patient detail page** — new "Message {username}" link (green,
+  MessagesSquare icon) alongside the existing "Ask AI about this patient"
+  link (indigo). Clearly distinguishes real messaging from AI Q&A.
+- **`env.ts`** — `PUBLIC_BACKEND_URL` (NEXT_PUBLIC_) so the browser knows
+  where to connect the socket.
+- **`types.ts`** — `ChatMessage` + `PractitionerConversation` types.
+
+### Seed update
+- Demo patient (`demo`) and Dr. Anya Sharma (`dranya`) now have a seeded
+  6-message conversation about sleep plans. The seeder establishes an
+  active connection (simulating appointment acceptance) before seeding
+  messages. Idempotent (skips if messages already exist). `--force` wipes
+  chat data too.
+
+### Dependencies
+- Backend: `python-socketio` (added via `uv add`).
+- Frontend + Practitioner: `socket.io-client` (added via `npm install`).
+

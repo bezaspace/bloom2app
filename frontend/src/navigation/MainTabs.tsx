@@ -3,11 +3,13 @@ import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { DashboardScreen } from "../screens/DashboardScreen";
 import { VoiceAssistantScreen } from "../screens/VoiceAssistantScreen";
 import { PractitionersScreen } from "../screens/PractitionersScreen";
+import { ChatScreen } from "../screens/ChatScreen";
 
 export type MainTabsParamList = {
   Dashboard: undefined;
   Talk: undefined;
   Practitioners: undefined;
+  Messages: undefined;
 };
 
 const Tab = createBottomTabNavigator<MainTabsParamList>();
@@ -62,6 +64,17 @@ export function MainTabs({ onLogout }: MainTabsProps) {
         }}
       >
         {() => <PractitionersScreen />}
+      </Tab.Screen>
+      <Tab.Screen
+        name="Messages"
+        options={{
+          tabBarLabel: "Messages",
+          tabBarIcon: ({ color, size }) => (
+            <TabIcon color={color} size={size} label={"\u{1F4AC}"} />
+          ),
+        }}
+      >
+        {() => <ChatScreen />}
       </Tab.Screen>
     </Tab.Navigator>
   );

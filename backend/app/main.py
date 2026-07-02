@@ -43,6 +43,9 @@ from app.practitioner_auth import router as practitioner_auth_router
 from app.practitioner_routes import router as practitioner_router
 from app.patient_practitioner_routes import router as patient_practitioner_router
 from app.plan_routes import router as plan_router
+from app.chat_routes import patient_router as chat_patient_router
+from app.chat_routes import practitioner_router as chat_practitioner_router
+from app.chat_socket import make_socketio_app
 from app.database import (
     add_biomarkers,
     add_doc_record,
@@ -107,6 +110,14 @@ app.include_router(practitioner_auth_router)
 app.include_router(practitioner_router)
 app.include_router(patient_practitioner_router)
 app.include_router(plan_router)
+app.include_router(chat_patient_router)
+app.include_router(chat_practitioner_router)
+
+# Mount the Socket.io server for real-time chat. The socket.io endpoint is
+# served at /chat-ws/socket.io/ (mount prefix + socketio_path). Clients connect
+# with path "/chat-ws/socket.io". A dedicated prefix avoids clashing with the
+# voice WebSocket route at /ws/{user_id}/{session_id}.
+app.mount("/chat-ws", make_socketio_app())
 
 
 @app.on_event("startup")

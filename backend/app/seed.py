@@ -527,8 +527,10 @@ async def seed_demo_practitioners(force: bool = False) -> bool:
             conn.execute("DELETE FROM practitioner_notes")
             conn.execute("DELETE FROM practitioner_tokens")
             conn.execute("DELETE FROM practitioners")
+            conn.execute("DELETE FROM chat_messages")
+            conn.execute("DELETE FROM ws_tokens")
             conn.commit()
-        logger.info("Seed: --force wiped all practitioner data.")
+        logger.info("Seed: --force wiped all practitioner + chat data.")
 
     created = []
     for pdata in DEMO_PRACTITIONERS:
@@ -569,7 +571,46 @@ async def seed_demo_practitioners(force: bool = False) -> bool:
             "Seed: practitioners ready. Log in with '%s' / '%s'",
             DEMO_PRACTITIONERS[0]["username"], DEMO_PASSWORD,
         )
+
+    # Seed a demo chat conversation between the demo patient and Dr. Anya.
+    # Requires an active connection, so establish one (simulating that the
+    # practitioner accepted the appointment).
+    if created:
+        await _seed_demo_chat(created[0]["id"], created[0]["username"])
+
     return bool(created)
+
+
+async def _seed_demo_chat(practitioner_id: int, practitioner_username: str) -> None:
+    """Seed a short demo chat conversation between the demo patient and the
+    given practitioner. Idempotent: skips if any messages already exist for
+    this conversation."""
+    from app.chat_db import _save_message_sync, _list_messages_sync
+    from app.chat_db import _conversation_id
+    from app.practitioner_db import ensure_connection
+
+    conv = _conversation_id(practitioner_id, DEMO_USERNAME)
+    existing = _list_messages_sync(conv, limit=1)
+    if existing:
+        return
+
+    # Ensure an active connection exists (so the chat is authorized).
+    await ensure_connection(practitioner_id, DEMO_USERNAME)
+
+    demo_messages = [
+        ("patient", "Hi Dr. Sharma, thanks for accepting my appointment! I had a quick question about my sleep plan."),
+        ("practitioner", "Of course! I saw your sleep has been averaging around 6 hours — let's work on getting that closer to 8. Are you currently using the meditation track before bed?"),
+        ("patient", "Yes, I've been doing the 10-minute guided meditation most nights. It helps, but I still wake up around 3am sometimes."),
+        ("practitioner", "That's great that you're consistent with meditation. The 3am wakeups are common — try moving your last meal earlier and avoiding screens after 9pm. Let's revisit at our appointment on Thursday."),
+        ("patient", "Sounds good, I'll try that. Should I keep logging my sleep in the app?"),
+        ("practitioner", "Absolutely — the sleep logs are really helpful for spotting patterns. Keep it up! 👍"),
+    ]
+    for sender, body in demo_messages:
+        _save_message_sync(practitioner_id, DEMO_USERNAME, sender, body)
+    logger.info(
+        "Seed: created demo chat conversation between '%s' and '%s' (%d messages).",
+        DEMO_USERNAME, practitioner_username, len(demo_messages),
+    )
 
 
 # ---------------------------------------------------------------------------

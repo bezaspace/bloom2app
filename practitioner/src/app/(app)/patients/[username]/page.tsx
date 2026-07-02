@@ -1,7 +1,7 @@
 import { apiJson } from "@/lib/api";
 import type { PatientDetail, BiomarkerGroup, PractitionerNote } from "@/lib/types";
 import Link from "next/link";
-import { ChatLink, AISummaryCard, NotesPanel, PlanDesignerLink, AnalyticsLink } from "@/components/patients/PatientPanels";
+import { ChatLink, AISummaryCard, NotesPanel, PlanDesignerLink, AnalyticsLink, MessagePatientLink } from "@/components/patients/PatientPanels";
 
 export default async function PatientDetailPage({
   params,
@@ -192,6 +192,7 @@ export default async function PatientDetailPage({
           <NotesPanel username={username} notes={notes} />
 
           <ChatLink username={username} />
+          <MessagePatientLink username={username} />
           <PlanDesignerLink username={username} />
           <AnalyticsLink username={username} />
         </>

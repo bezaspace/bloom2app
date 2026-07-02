@@ -154,6 +154,10 @@ def _init_db_sync() -> None:
     from app.plan_db import _init_plan_db_sync
     _init_plan_db_sync()
 
+    # Initialize the chat tables (chat_messages, ws_tokens).
+    from app.chat_db import _init_chat_db_sync
+    _init_chat_db_sync()
+
 
 def _register_user_sync(username: str, password: str) -> bool:
     salt = _make_salt()

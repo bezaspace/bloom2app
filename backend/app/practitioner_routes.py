@@ -369,3 +369,19 @@ async def patient_ai_chat(
     from app.practitioner_ai import answer_practitioner_question
     answer = await answer_practitioner_question(username, body.question)
     return {"status": "success", "answer": answer}
+
+
+# ---------------------------------------------------------------------------
+# Short-lived WebSocket token (for the practitioner web app's browser to
+# authenticate a Socket.io connection without exposing the long-lived bearer
+# token). The Next.js BFF mints this via this endpoint and hands it to the
+# browser.
+# ---------------------------------------------------------------------------
+@router.post("/ws-token")
+async def mint_ws_token(
+    practitioner_id: int = Depends(get_current_practitioner_id),
+) -> dict:
+    """Mint a single-use, short-lived (60s) token for Socket.io auth."""
+    from app.chat_db import create_ws_token
+    token, ttl = await create_ws_token(practitioner_id)
+    return {"status": "success", "token": token, "expires_in": ttl}

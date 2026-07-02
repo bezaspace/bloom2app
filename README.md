@@ -14,14 +14,16 @@ mid-sentence, just like a real conversation.
 │  React Native (Expo)  │ <------------------------------------------> │  FastAPI + ADK        │
 │  (patient mobile app) │                                              │  Runner.run_live()    │
 │  Dashboard | Talk |   │   REST (bearer token)                        │  LiveRequestQueue     │
-│  Practitioners        │ <------------------------------------------> │  Gemini Live API      │
-└───────────────────────┘                                              │  + practitioner API   │
-                                                                       │  + appointment API    │
-┌───────────────────────┐   REST (httpOnly cookie → BFF → bearer)      │  + practitioner AI    │
+│  Practitioners |      │ <------------------------------------------> │  Gemini Live API      │
+│  Messages             │   Socket.io (bearer token auth)              │  + practitioner API   │
+└───────────────────────┘ <------------------------------------------> │  + appointment API    │
+                                                                       │  + practitioner AI    │
+┌───────────────────────┐   REST (httpOnly cookie → BFF → bearer)      │  + chat (Socket.io)   │
 │  Next.js 16 (web)     │ <------------------------------------------> │                       │
-│  (practitioner app)   │                                              └──────────────────────┘
-│  Dashboard | Appts |  │
-│  Patients | Settings  │
+│  (practitioner app)   │   Socket.io (short-lived WS token via BFF)   └──────────────────────┘
+│  Dashboard | Appts |  │ <------------------------------------------> 
+│  Patients | Messages  │
+│  Settings             │
 └───────────────────────┘
 ```
 
@@ -216,6 +218,9 @@ bloom2app/
 │       ├── practitioner_routes.py ← practitioner API (appts, patients, AI, notes)
 │       ├── patient_practitioner_routes.py ← patient API (browse/book appts)
 │       ├── practitioner_ai.py  ← Gemini Flash-Lite patient summaries + chat
+│       ├── chat_db.py          ← SQLite chat message + WS token store
+│       ├── chat_socket.py      ← Socket.io server (real-time chat)
+│       ├── chat_routes.py      ← chat REST endpoints (history, send, read)
 │       ├── dashboard/          ← AI schedule generator + biomarker extraction
 │       └── voice_agent/
 │           ├── agent.py        ← ADK Agent definition (Bloom)
@@ -229,9 +234,11 @@ bloom2app/
 │       ├── types.ts            ← ADK event types
 │       ├── dashboard.ts        ← dashboard API client
 │       ├── practitioners.ts    ← practitioner/appointment API client
+│       ├── chat.ts             ← chat API client (conversations, messages)
 │       ├── useVoiceAssistant.ts ← WebSocket + audio orchestration hook
-│       ├── navigation/         ← RootNavigator + MainTabs (3 tabs)
-│       ├── screens/            ← Auth, Dashboard, VoiceAssistant, Practitioners
+│       ├── useChatSocket.ts    ← Socket.io hook for real-time chat
+│       ├── navigation/         ← RootNavigator + MainTabs (4 tabs)
+│       ├── screens/            ← Auth, Dashboard, VoiceAssistant, Practitioners, Chat
 │       └── audio/              ← platform-aware audio engine
 └── practitioner/               ← Next.js 16 practitioner web app
     ├── AGENTS.md               ← architecture & conventions
@@ -241,9 +248,9 @@ bloom2app/
     │   ├── lib/                ← env, session (cookie), api (BFF fetch), types
     │   ├── app/
     │   │   ├── (auth)/         ← login + register pages
-    │   │   ├── (app)/          ← auth-gated: dashboard, appointments, patients, settings
-    │   │   └── api/            ← BFF route handlers (auth + catch-all proxy)
-    │   └── components/         ← layout (sidebar/topbar), appointments, patients
+    │   │   ├── (app)/          ← auth-gated: dashboard, appointments, patients, messages, settings
+    │   │   └── api/            ← BFF route handlers (auth + ws-token + catch-all proxy)
+    │   └── components/         ← layout (sidebar/topbar), appointments, patients (incl. MessageThread)
     └── package.json
 ```
 
@@ -271,5 +278,6 @@ bloom2app/
 | Agent         | Google ADK (Agent Development Kit) Python               |
 | Voice model   | Gemini Live API — `gemini-3.1-flash-live-preview`       |
 | AI (docs/prac)| Gemini `gemini-3.1-flash-lite` (structured output)      |
-| Transport     | WebSocket (voice) + REST (dashboard/practitioner)       |
+| Transport     | WebSocket (voice) + REST (dashboard/practitioner) + Socket.io (chat) |
+| Real-time chat| python-socketio (server) + socket.io-client (both apps) |
 | Auth          | Bearer tokens (patient) + BFF httpOnly cookie (practitioner) |
