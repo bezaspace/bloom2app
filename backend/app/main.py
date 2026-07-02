@@ -39,6 +39,9 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # pylint: disable=wrong-import-position
 from app.auth import get_current_user
 from app.auth import router as auth_router
+from app.practitioner_auth import router as practitioner_auth_router
+from app.practitioner_routes import router as practitioner_router
+from app.patient_practitioner_routes import router as patient_practitioner_router
 from app.database import (
     add_biomarkers,
     add_doc_record,
@@ -99,6 +102,9 @@ runner = Runner(
 )
 
 app.include_router(auth_router)
+app.include_router(practitioner_auth_router)
+app.include_router(practitioner_router)
+app.include_router(patient_practitioner_router)
 
 
 @app.on_event("startup")

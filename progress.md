@@ -47,3 +47,23 @@ High-level feature map of what's been built in Bloom2 so far.
 - **Idempotent**: skips if the demo user is already onboarded. `--force` wipes the demo user's data across all tables (via `delete_user_cascade`) and re-seeds.
 - CLI: `uv run python -m app.seed` (seed if empty), `--force` (wipe + re-seed), `--check` (status only).
 - `database.py` gained a `delete_user_cascade` helper that removes a user and all associated rows from `biomarkers`, `daily_logs`, `daily_schedules`, `user_docs`, `user_profiles`, `tokens`, and `users`.
+
+## 7. Practitioner web app + appointment booking
+- **New `practitioner/` folder** — Next.js 16 (App Router) web app for practitioners to manage appointments and track connected patients' progress. Uses a BFF (Backend-for-Frontend) auth pattern: httpOnly cookie on the Next.js origin, bearer token forwarded server-side to FastAPI. The browser never talks to FastAPI directly.
+  - **Auth** — self-registration + login (`/login`, `/register`); `proxy.ts` gates all `/(app)/*` routes.
+  - **Dashboard** — pending appointment count, connected patients count, upcoming appointments, recent activity.
+  - **Appointments** — table with filter tabs (pending/accepted/completed/declined/all); accept (auto-creates connection), decline, complete actions.
+  - **Patients list** — connected patients with day-of-plan, phase, biomarker count, AI-summary badge.
+  - **Patient detail** — full view: profile, plan summary, today's schedule (with check-offs), wellness domain log counts, biomarker groups with latest/prior/delta + status, health document summary, practitioner notes (add/list), AI summary card, link to per-patient AI chat.
+  - **AI chat** — per-patient text chat grounded in that patient's live data (stateless per question).
+  - **Settings** — edit practitioner profile (name, title, specialization, bio, contact, fee).
+- **Backend extensions:**
+  - `practitioner_db.py` — SQLite store for practitioners, practitioner_tokens, appointments, practitioner_patient_connections, practitioner_notes.
+  - `practitioner_auth.py` — practitioner auth routes + `get_current_practitioner` dependency (separate from patient auth).
+  - `practitioner_routes.py` — practitioner-facing endpoints (appointments management, connected patients, patient detail data access with connection check, notes, AI summary/chat).
+  - `patient_practitioner_routes.py` — patient-facing endpoints (browse practitioners, book appointment, my appointments, cancel).
+  - `practitioner_ai.py` — Gemini Flash-Lite patient progress summaries + per-patient Q&A grounded in patient data.
+  - Authorization: every `/practitioner/patients/{username}/*` endpoint verifies an active `practitioner_patient_connections` row before returning data.
+- **Mobile app 3rd tab** — "Practitioners" tab with: searchable practitioner list, practitioner detail, book appointment form, my appointments view (with status badges + cancel for pending).
+- **Seed extension** — 3 demo practitioners (`dranya`/`drchen`/`marcop`, all password `demodemo`) + one demo appointment from the `demo` patient to `dranya` (pending). Auto-seeds alongside the demo patient.
+

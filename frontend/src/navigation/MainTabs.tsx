@@ -2,10 +2,12 @@ import { StyleSheet, Text, View } from "react-native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { DashboardScreen } from "../screens/DashboardScreen";
 import { VoiceAssistantScreen } from "../screens/VoiceAssistantScreen";
+import { PractitionersScreen } from "../screens/PractitionersScreen";
 
 export type MainTabsParamList = {
   Dashboard: undefined;
   Talk: undefined;
+  Practitioners: undefined;
 };
 
 const Tab = createBottomTabNavigator<MainTabsParamList>();
@@ -14,7 +16,7 @@ interface MainTabsProps {
   onLogout: () => void;
 }
 
-/** Bottom tab navigator: Dashboard | Talk. */
+/** Bottom tab navigator: Dashboard | Talk | Practitioners. */
 export function MainTabs({ onLogout }: MainTabsProps) {
   return (
     <Tab.Navigator
@@ -49,6 +51,17 @@ export function MainTabs({ onLogout }: MainTabsProps) {
         }}
       >
         {() => <VoiceAssistantScreen onLogout={onLogout} />}
+      </Tab.Screen>
+      <Tab.Screen
+        name="Practitioners"
+        options={{
+          tabBarLabel: "Practitioners",
+          tabBarIcon: ({ color, size }) => (
+            <TabIcon color={color} size={size} label={"\u{1F465}"} />
+          ),
+        }}
+      >
+        {() => <PractitionersScreen />}
       </Tab.Screen>
     </Tab.Navigator>
   );

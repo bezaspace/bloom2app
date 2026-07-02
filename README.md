@@ -12,22 +12,40 @@ mid-sentence, just like a real conversation.
 ```
 ┌───────────────────────┐   WebSocket (16kHz PCM ↑ / JSON events ↓)   ┌──────────────────────┐
 │  React Native (Expo)  │ <------------------------------------------> │  FastAPI + ADK        │
-│  Web Audio API (web)  │                                              │  Runner.run_live()    │
-│  expo-audio-stream    │                                              │  LiveRequestQueue     │
-│  (native Android/iOS) │                                              │  Gemini Live API      │
-└───────────────────────┘                                              └──────────────────────┘
+│  (patient mobile app) │                                              │  Runner.run_live()    │
+│  Dashboard | Talk |   │   REST (bearer token)                        │  LiveRequestQueue     │
+│  Practitioners        │ <------------------------------------------> │  Gemini Live API      │
+└───────────────────────┘                                              │  + practitioner API   │
+                                                                       │  + appointment API    │
+┌───────────────────────┐   REST (httpOnly cookie → BFF → bearer)      │  + practitioner AI    │
+│  Next.js 16 (web)     │ <------------------------------------------> │                       │
+│  (practitioner app)   │                                              └──────────────────────┘
+│  Dashboard | Appts |  │
+│  Patients | Settings  │
+└───────────────────────┘
 ```
 
-- **Frontend** (`frontend/`) — Expo SDK 57 / React Native. Captures microphone
-  audio as 16kHz PCM chunks, streams them over a WebSocket, and plays back the
-  24kHz PCM audio chunks returned by the model. Shows live transcripts of both
-  sides of the conversation. Uses a platform-aware audio layer: the **Web Audio
-  API** when running in a browser (Expo Web), and `@mykin-ai/expo-audio-stream`
-  on native Android/iOS.
-- **Backend** (`backend/`) — FastAPI server using ADK's `Runner.run_live()` to
-  bridge the WebSocket to the Gemini Live API. The agent ("Bloom") is defined
-  with ADK's `Agent` class and uses the `gemini-3.1-flash-live-preview`
-  native-audio live model for low-latency spoken responses.
+- **Frontend** (`frontend/`) — Expo SDK 57 / React Native. The patient-facing
+  mobile app. Captures microphone audio as 16kHz PCM chunks, streams them over
+  a WebSocket, and plays back the 24kHz PCM audio chunks returned by the model.
+  Shows live transcripts of both sides of the conversation. Three tabs:
+  **Dashboard** (wellness progress), **Talk** (voice assistant), and
+  **Practitioners** (browse/book appointments). Uses a platform-aware audio
+  layer: the **Web Audio API** when running in a browser (Expo Web), and
+  `@mykin-ai/expo-audio-stream` on native Android/iOS.
+- **Backend** (`backend/`) — FastAPI server. Serves the patient voice
+  assistant via ADK's `Runner.run_live()` bridging the WebSocket to the Gemini
+  Live API (agent "Bloom" uses `gemini-3.1-flash-live-preview`). Also serves
+  the patient dashboard REST API, the practitioner directory + appointment
+  booking API, the practitioner-facing patient-data API (with connection-based
+  authorization), and the practitioner AI features (Gemini Flash-Lite patient
+  summaries + per-patient chat).
+- **Practitioner** (`practitioner/`) — Next.js 16 (App Router) web app for
+  practitioners. Self-registration + login, appointment management (accept/
+  decline/complete), connected-patient tracking (schedule, logs, biomarkers,
+  notes), AI patient summaries, and per-patient AI chat. Uses a **BFF** auth
+  pattern: httpOnly cookie on the Next.js origin, bearer token forwarded
+  server-side to FastAPI — the browser never talks to FastAPI directly.
 
 ## Prerequisites
 
@@ -57,10 +75,21 @@ cd frontend
 npm install                   # install JS dependencies
 ```
 
+### 3. Practitioner web app
+
+```bash
+cd practitioner
+npm install                   # install JS dependencies
+```
+
+The practitioner app reads `PRACTITIONER_BACKEND_URL` from `practitioner/.env.local`
+(defaults to `http://localhost:8000`). No changes needed for local development.
+
 ## Running
 
-You need both the backend and the frontend running simultaneously — in two
-separate terminals.
+You need the backend running, plus whichever frontend(s) you want to use.
+The patient mobile app and the practitioner web app can run simultaneously
+against the same backend.
 
 ### Quick start with launcher scripts
 
@@ -69,6 +98,13 @@ From the project root:
 ```bash
 ./sb          # starts the backend  (terminal 1)
 ./sf          # starts the frontend  (terminal 2, web mode — opens browser)
+```
+
+To start the practitioner web app (terminal 3):
+
+```bash
+cd practitioner
+npm run dev   # http://localhost:3000
 ```
 
 `./sf` defaults to **web mode** for development. You can also pass a platform:
@@ -134,12 +170,18 @@ or emulator.
 
 ## Demo data (seed)
 
-The backend auto-seeds a demo user on first startup (when the database is
-empty), so you can immediately test the dashboard and voice features without
-onboarding yourself. The demo user has an onboarded profile, a 90-day plan,
-today's schedule, 7 days of logs (with streaks), and biomarker trends.
+The backend auto-seeds demo data on first startup (when the database is
+empty), so you can immediately test all features without manual onboarding.
 
-- **Demo login**: `demo` / `demodemo`
+**Demo patient** — has an onboarded profile, a 90-day plan (day 14), today's
+schedule, 7 days of logs (with streaks), and biomarker trends.
+
+- **Demo patient login**: `demo` / `demodemo`
+
+**Demo practitioners** — 3 practitioner accounts for testing the practitioner
+web app, plus one pending appointment from the demo patient to Dr. Anya Sharma.
+
+- **Demo practitioner login**: `dranya` / `demodemo` (also `drchen`, `marcop`)
 
 To control seeding manually:
 
@@ -165,27 +207,44 @@ bloom2app/
 │   ├── pyproject.toml
 │   └── app/
 │       ├── main.py             ← FastAPI + WebSocket + ADK run_live()
-│       ├── auth.py             ← auth routes & dependency (SQLite)
-│       ├── database.py         ← SQLite user/token/log/biomarker store
-│       ├── seed.py             ← demo data seeder (auto-runs on first startup)
+│       ├── auth.py             ← patient auth routes & dependency (SQLite)
+│       ├── database.py         ← SQLite patient store (users/tokens/logs/biomarkers)
+│       ├── seed.py             ← demo data seeder (patient + practitioners)
 │       ├── document_processor.py ← Gemini Flash-Lite doc summary extraction
+│       ├── practitioner_db.py  ← SQLite practitioner/appointment/connection store
+│       ├── practitioner_auth.py ← practitioner auth routes & dependency
+│       ├── practitioner_routes.py ← practitioner API (appts, patients, AI, notes)
+│       ├── patient_practitioner_routes.py ← patient API (browse/book appts)
+│       ├── practitioner_ai.py  ← Gemini Flash-Lite patient summaries + chat
 │       ├── dashboard/          ← AI schedule generator + biomarker extraction
 │       └── voice_agent/
 │           ├── agent.py        ← ADK Agent definition (Bloom)
 │           └── tools.py        ← 8 tools: onboarding + progress reads + voice logs
-└── frontend/
-    ├── App.tsx                 ← Voice assistant UI + auth screen
-    ├── app.json                ← Expo config (mic permission)
-    └── src/
-        ├── auth.ts             ← login/register API + token storage
-        ├── config.ts           ← backend host/port
-        ├── types.ts            ← ADK event types
-        ├── useVoiceAssistant.ts    ← WebSocket + audio orchestration hook
-        └── audio/
-            ├── types.ts        ← AudioEngine interface (shared)
-            ├── audioEngine.ts  ← platform-aware factory
-            ├── WebAudioEngine.ts    ← browser impl (Web Audio API)
-            └── NativeAudioEngine.ts ← native impl (expo-audio-stream)
+├── frontend/
+│   ├── App.tsx                 ← Root navigator
+│   ├── app.json                ← Expo config (mic permission)
+│   └── src/
+│       ├── auth.ts             ← login/register API + token storage
+│       ├── config.ts           ← backend host/port
+│       ├── types.ts            ← ADK event types
+│       ├── dashboard.ts        ← dashboard API client
+│       ├── practitioners.ts    ← practitioner/appointment API client
+│       ├── useVoiceAssistant.ts ← WebSocket + audio orchestration hook
+│       ├── navigation/         ← RootNavigator + MainTabs (3 tabs)
+│       ├── screens/            ← Auth, Dashboard, VoiceAssistant, Practitioners
+│       └── audio/              ← platform-aware audio engine
+└── practitioner/               ← Next.js 16 practitioner web app
+    ├── AGENTS.md               ← architecture & conventions
+    ├── .env.local              ← PRACTITIONER_BACKEND_URL
+    ├── src/
+    │   ├── proxy.ts            ← auth gate (redirects unauthed to /login)
+    │   ├── lib/                ← env, session (cookie), api (BFF fetch), types
+    │   ├── app/
+    │   │   ├── (auth)/         ← login + register pages
+    │   │   ├── (app)/          ← auth-gated: dashboard, appointments, patients, settings
+    │   │   └── api/            ← BFF route handlers (auth + catch-all proxy)
+    │   └── components/         ← layout (sidebar/topbar), appointments, patients
+    └── package.json
 ```
 
 ## Platform notes
@@ -202,12 +261,15 @@ bloom2app/
 
 ## Tech stack
 
-| Layer      | Technology                                              |
-|------------|---------------------------------------------------------|
-| Frontend   | React Native 0.86, Expo SDK 57, TypeScript              |
-| Audio (web)  | Web Audio API (getUserMedia, AudioBufferSourceNode)   |
-| Audio (native) | @mykin-ai/expo-audio-stream (AudioTrack/AudioRecord) |
-| Backend    | FastAPI, Uvicorn, uv                                    |
-| Agent      | Google ADK (Agent Development Kit) Python               |
-| Model      | Gemini Live API — `gemini-3.1-flash-live-preview`       |
-| Transport  | WebSocket (bidirectional, binary audio + JSON events)   |
+| Layer         | Technology                                              |
+|---------------|---------------------------------------------------------|
+| Patient app   | React Native 0.86, Expo SDK 57, TypeScript              |
+| Audio (web)   | Web Audio API (getUserMedia, AudioBufferSourceNode)     |
+| Audio (native)| @mykin-ai/expo-audio-stream (AudioTrack/AudioRecord)    |
+| Practitioner  | Next.js 16 (App Router), React 19, TypeScript, Tailwind v4 |
+| Backend       | FastAPI, Uvicorn, uv                                    |
+| Agent         | Google ADK (Agent Development Kit) Python               |
+| Voice model   | Gemini Live API — `gemini-3.1-flash-live-preview`       |
+| AI (docs/prac)| Gemini `gemini-3.1-flash-lite` (structured output)      |
+| Transport     | WebSocket (voice) + REST (dashboard/practitioner)       |
+| Auth          | Bearer tokens (patient) + BFF httpOnly cookie (practitioner) |

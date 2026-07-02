@@ -34,6 +34,11 @@ from app.database import (
     save_daily_schedule,
     save_profile,
 )
+from app.practitioner_db import (
+    create_appointment,
+    get_practitioner_by_username,
+    register_practitioner,
+)
 
 logger = logging.getLogger("bloom2.seed")
 
@@ -449,6 +454,125 @@ def _build_biomarkers() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Demo practitioners
+# ---------------------------------------------------------------------------
+DEMO_PRACTITIONERS = [
+    {
+        "username": "dranya",
+        "password": DEMO_PASSWORD,
+        "full_name": "Dr. Anya Sharma",
+        "title": "MD",
+        "specialization": "Endocrinology",
+        "bio": (
+            "Board-certified endocrinologist focused on metabolic health, "
+            "diabetes management, and thyroid disorders. 12 years of "
+            "experience helping patients reverse prediabetes through "
+            "lifestyle medicine."
+        ),
+        "email": "anya.sharma@bloom.demo",
+        "phone": "+1-555-0101",
+        "years_experience": 12,
+        "consultation_fee": 150.0,
+    },
+    {
+        "username": "marcop",
+        "password": DEMO_PASSWORD,
+        "full_name": "Marco Perez",
+        "title": "Nutritionist",
+        "specialization": "Nutrition & Diet",
+        "bio": (
+            "Registered dietitian specializing in sustainable weight "
+            "management, plant-based nutrition, and sports nutrition. "
+            "Believes in small, lasting habit changes over restrictive diets."
+        ),
+        "email": "marco.perez@bloom.demo",
+        "phone": "+1-555-0102",
+        "years_experience": 8,
+        "consultation_fee": 90.0,
+    },
+    {
+        "username": "drchen",
+        "password": DEMO_PASSWORD,
+        "full_name": "Dr. Lin Chen",
+        "title": "MD",
+        "specialization": "Mental Health",
+        "bio": (
+            "Psychiatrist with a focus on integrative mental health — "
+            "combining evidence-based therapy, mindfulness, and lifestyle "
+            "interventions for anxiety, depression, and stress-related "
+            "conditions."
+        ),
+        "email": "lin.chen@bloom.demo",
+        "phone": "+1-555-0103",
+        "years_experience": 15,
+        "consultation_fee": 175.0,
+    },
+]
+
+
+async def seed_demo_practitioners(force: bool = False) -> bool:
+    """Seed demo practitioner accounts and one demo appointment.
+
+    Idempotent: skips practitioners that already exist unless ``force`` is
+    True (which wipes all practitioner data first).
+    """
+    await init_db()
+
+    if force:
+        import sqlite3
+        from app.database import DB_PATH, _lock
+        with _lock, sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM practitioner_patient_connections")
+            conn.execute("DELETE FROM appointments")
+            conn.execute("DELETE FROM practitioner_notes")
+            conn.execute("DELETE FROM practitioner_tokens")
+            conn.execute("DELETE FROM practitioners")
+            conn.commit()
+        logger.info("Seed: --force wiped all practitioner data.")
+
+    created = []
+    for pdata in DEMO_PRACTITIONERS:
+        existing = await get_practitioner_by_username(pdata["username"])
+        if existing:
+            logger.info("Seed: practitioner '%s' already exists — skipping.", pdata["username"])
+            created.append(existing)
+            continue
+        p = await register_practitioner(pdata)
+        if p:
+            created.append(p)
+            logger.info("Seed: created practitioner '%s' (%s).", p["username"], p["full_name"])
+        else:
+            logger.warning("Seed: failed to create practitioner '%s'.", pdata["username"])
+
+    # Seed one demo appointment from the demo patient to the first practitioner,
+    # in pending status, so the practitioner web app has something to act on.
+    if created:
+        from app.practitioner_db import list_appointments_for_patient
+        existing_appts = await list_appointments_for_patient(DEMO_USERNAME)
+        if not existing_appts:
+            target_date = (date.today() + timedelta(days=3)).isoformat()
+            await create_appointment({
+                "patient_username": DEMO_USERNAME,
+                "practitioner_id": created[0]["id"],
+                "requested_date": target_date,
+                "requested_time": "10:00",
+                "reason": "Initial consultation — review recent labs and 90-day plan",
+                "patient_note": "I'd like to discuss my HbA1c trend and sleep plan.",
+            })
+            logger.info(
+                "Seed: created demo appointment from '%s' to '%s' on %s (pending).",
+                DEMO_USERNAME, created[0]["username"], target_date,
+            )
+
+    if created:
+        logger.info(
+            "Seed: practitioners ready. Log in with '%s' / '%s'",
+            DEMO_PRACTITIONERS[0]["username"], DEMO_PASSWORD,
+        )
+    return bool(created)
+
+
+# ---------------------------------------------------------------------------
 # Seed logic
 # ---------------------------------------------------------------------------
 async def seed_demo_data(force: bool = False) -> bool:
@@ -464,6 +588,10 @@ async def seed_demo_data(force: bool = False) -> bool:
 
     if existing and existing.get("onboarded") and not force:
         logger.info("Seed: demo user already onboarded — skipping (use --force to re-seed).")
+        # Still ensure demo practitioners are seeded (they're independent of
+        # the demo patient and may not exist yet on a DB where the patient
+        # was seeded before the practitioner feature existed).
+        await seed_demo_practitioners(force=False)
         return False
 
     if force:
@@ -515,6 +643,10 @@ async def seed_demo_data(force: bool = False) -> bool:
     logger.info("Seed: saved %d biomarker readings (4 markers).", len(readings))
 
     logger.info("Seed: complete. Log in with %s / %s", DEMO_USERNAME, DEMO_PASSWORD)
+
+    # Also seed demo practitioners + a demo appointment.
+    await seed_demo_practitioners(force=force)
+
     return True
 
 
@@ -529,6 +661,16 @@ async def check_seed_status() -> None:
     else:
         print(f"Demo user '{DEMO_USERNAME}' is NOT seeded.")
         print("  Run `uv run python -m app.seed` to seed.")
+
+    # Practitioner seed status.
+    from app.practitioner_db import get_practitioner_by_username
+    prac = await get_practitioner_by_username(DEMO_PRACTITIONERS[0]["username"])
+    if prac:
+        print(f"Demo practitioners are seeded ({len(DEMO_PRACTITIONERS)} accounts).")
+        print(f"  Practitioner login: {DEMO_PRACTITIONERS[0]['username']} / {DEMO_PASSWORD}")
+    else:
+        print("Demo practitioners are NOT seeded.")
+        print("  Run `uv run python -m app.seed` to seed them alongside the demo user.")
 
 
 def main() -> None:

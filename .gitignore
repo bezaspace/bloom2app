@@ -32,6 +32,10 @@ dist/
 web-build/
 expo-env.d.ts
 
+# Next.js (practitioner app)
+.next/
+out/
+
 # Native
 .kotlin/
 *.orig.*

@@ -145,6 +145,10 @@ def _init_db_sync() -> None:
         )
         conn.commit()
 
+    # Initialize the practitioner-side tables (separate module, same DB file).
+    from app.practitioner_db import _init_practitioner_db_sync
+    _init_practitioner_db_sync()
+
 
 def _register_user_sync(username: str, password: str) -> bool:
     salt = _make_salt()
