@@ -104,6 +104,11 @@ app.include_router(auth_router)
 @app.on_event("startup")
 async def startup() -> None:
     await init_db()
+    # Auto-seed demo data on first run (when the DB has no onboarded demo user).
+    # Set SEED_ON_STARTUP=false in .env to disable.
+    if os.getenv("SEED_ON_STARTUP", "true").lower() != "false":
+        from app.seed import seed_demo_data
+        await seed_demo_data()
 
 
 @app.get("/health")

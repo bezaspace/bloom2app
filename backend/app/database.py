@@ -601,3 +601,23 @@ async def list_biomarkers(username: str) -> list[dict]:
 
 async def list_biomarkers_by_name(username: str, name: str) -> list[dict]:
     return await asyncio.to_thread(_list_biomarkers_by_name_sync, username, name)
+
+
+# ---------------------------------------------------------------------------
+# Cascade delete (used by the seed script's --force flag)
+# ---------------------------------------------------------------------------
+def _delete_user_cascade_sync(username: str) -> None:
+    """Delete a user and ALL associated data across every table."""
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM biomarkers WHERE username = ?", (username,))
+        conn.execute("DELETE FROM daily_logs WHERE username = ?", (username,))
+        conn.execute("DELETE FROM daily_schedules WHERE username = ?", (username,))
+        conn.execute("DELETE FROM user_docs WHERE username = ?", (username,))
+        conn.execute("DELETE FROM user_profiles WHERE username = ?", (username,))
+        conn.execute("DELETE FROM tokens WHERE username = ?", (username,))
+        conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+
+
+async def delete_user_cascade(username: str) -> None:
+    await asyncio.to_thread(_delete_user_cascade_sync, username)

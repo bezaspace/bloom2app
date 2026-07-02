@@ -132,6 +132,27 @@ or emulator.
 3. You can interrupt Bloom while it's speaking by tapping the mic and talking.
 4. You can also type a message using the text input at the bottom.
 
+## Demo data (seed)
+
+The backend auto-seeds a demo user on first startup (when the database is
+empty), so you can immediately test the dashboard and voice features without
+onboarding yourself. The demo user has an onboarded profile, a 90-day plan,
+today's schedule, 7 days of logs (with streaks), and biomarker trends.
+
+- **Demo login**: `demo` / `demodemo`
+
+To control seeding manually:
+
+```bash
+cd backend
+uv run python -m app.seed              # seed if not already seeded
+uv run python -m app.seed --force      # wipe demo data and re-seed
+uv run python -m app.seed --check      # print seed status without modifying
+```
+
+Auto-seeding on startup is controlled by the `SEED_ON_STARTUP` env var
+(default `true`). Set `SEED_ON_STARTUP=false` in `backend/.env` to disable it.
+
 ## Project structure
 
 ```
@@ -145,9 +166,13 @@ bloom2app/
 │   └── app/
 │       ├── main.py             ← FastAPI + WebSocket + ADK run_live()
 │       ├── auth.py             ← auth routes & dependency (SQLite)
-│       ├── database.py         ← SQLite user/token store
+│       ├── database.py         ← SQLite user/token/log/biomarker store
+│       ├── seed.py             ← demo data seeder (auto-runs on first startup)
+│       ├── document_processor.py ← Gemini Flash-Lite doc summary extraction
+│       ├── dashboard/          ← AI schedule generator + biomarker extraction
 │       └── voice_agent/
-│           └── agent.py        ← ADK Agent definition (Bloom)
+│           ├── agent.py        ← ADK Agent definition (Bloom)
+│           └── tools.py        ← 8 tools: onboarding + progress reads + voice logs
 └── frontend/
     ├── App.tsx                 ← Voice assistant UI + auth screen
     ├── app.json                ← Expo config (mic permission)

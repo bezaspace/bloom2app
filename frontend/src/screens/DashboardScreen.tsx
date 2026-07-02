@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -10,6 +10,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
+import { useFocusEffect } from "@react-navigation/native";
 import {
   getDashboardToday,
   regenerateSchedule,
@@ -54,9 +55,18 @@ export function DashboardScreen({ onGoToTalk }: DashboardScreenProps) {
     }
   }, []);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  // Re-fetch whenever the Dashboard tab gains focus (including initial mount).
+  // The first focus shows the loading spinner; subsequent focuses (e.g. after
+  // the user logs something by voice on the Talk tab) refetch silently so the
+  // dashboard reflects voice-logged entries without a jarring spinner.
+  const firstFocus = useRef(true);
+  useFocusEffect(
+    useCallback(() => {
+      const silent = !firstFocus.current;
+      firstFocus.current = false;
+      void load(silent);
+    }, [load]),
+  );
 
   const handleRefresh = () => {
     setRefreshing(true);

@@ -70,6 +70,10 @@ export function WellnessDomainCard({
   const target = targetValue ?? 0;
   const progress = target > 0 ? Math.min(1, todayActual / target) : 0;
   const color = DOMAIN_COLORS[domain] || DOMAIN_COLORS.other;
+  // True if any of today's entries were logged by voice (via the Talk tab).
+  const hasVoiceLog = (todayEntries ?? []).some(
+    (e) => e.note === "via voice",
+  );
 
   // Build the last 7 days of bars (fill gaps with 0).
   const bars = buildSevenDayBars(recent, target, color);
@@ -79,6 +83,11 @@ export function WellnessDomainCard({
       <View style={styles.headerRow}>
         <Text style={styles.icon}>{icon}</Text>
         <Text style={styles.title}>{title}</Text>
+        {hasVoiceLog ? (
+          <View style={styles.voiceBadge}>
+            <Text style={styles.voiceBadgeText}>{"\u{1F3A4}"} via voice</Text>
+          </View>
+        ) : null}
         {target > 0 ? (
           <View style={styles.targetPill}>
             <Text style={styles.targetPillText}>
@@ -198,6 +207,14 @@ const styles = StyleSheet.create({
     borderRadius: 12,
   },
   targetPillText: { color: "#cbd5e1", fontSize: 11, fontWeight: "600" },
+  voiceBadge: {
+    backgroundColor: "#312e81",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+    marginRight: -4,
+  },
+  voiceBadgeText: { color: "#a5b4fc", fontSize: 10, fontWeight: "600" },
   bodyRow: { flexDirection: "row", alignItems: "center", gap: 16, marginBottom: 12 },
   actualCol: { flex: 1 },
   actualValue: { color: "#f1f5f9", fontSize: 22, fontWeight: "700" },
