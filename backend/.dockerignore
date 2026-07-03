@@ -1,0 +1,29 @@
+# Local virtualenv — built fresh inside the image
+.venv/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$pyClass
+*.so
+.Python
+
+# Local dev artifacts
+auth.db
+uploads/
+.env
+.env.local
+.env.*.local
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore

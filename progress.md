@@ -359,3 +359,372 @@ of natively async functions.
 - Idempotency verified (re-run skips; `--force` wipes and re-seeds).
 - JSONB data verified queryable with `->>` operator.
 
+
+## 11. Backend Dockerization (Phase 2 of staging plan)
+
+Multi-stage Docker build for the backend, following the official uv Docker
+guide (https://docs.astral.sh/uv/guides/integration/docker/).
+
+### What was built
+- `backend/Dockerfile` — two-stage build:
+  - **Builder:** `ghcr.io/astral-sh/uv:0.9.18-python3.12-trixie` creates a
+    self-contained `.venv` from the lockfile. Dependencies are installed
+    first (cacheable layer) then the project itself. `UV_COMPILE_BYTECODE=1`
+    pre-compiles `.pyc`, `UV_LINK_MODE=copy` makes the venv relocatable,
+    `UV_NO_DEV=1` skips dev deps, `UV_PROJECT_ENVIRONMENT=/app/.venv` pins
+    the venv path that gets copied to the runtime stage.
+  - **Runtime:** `python:3.12-slim`, no build toolchain. Runs as a
+    non-root `bloom` user (uid 1001). `/app/uploads` is created and owned
+    by that user so the Compose volume mount persists uploaded health
+    documents. The venv is on `PATH` so `uvicorn` resolves directly.
+    Production CMD is `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+    (no `--reload`, single worker — in-memory ADK session state is not
+    shared across workers).
+- `backend/.dockerignore` — excludes `.venv/`, `__pycache__/`, `auth.db`,
+  `uploads/`, `.env`, editor/OS noise so the build context stays small
+  and the local venv never leaks into the image.
+
+### Design notes
+- The service is **internal-only** by design — no host port is published
+  in the Compose stack. It is reached via the nginx reverse proxy
+  (Phase 5). The verification run below mapped a host port only for
+  manual testing.
+- `DATABASE_URL` defaults to localhost in `.env.example` for local dev;
+  the Compose service overrides it to `postgresql://...@postgres:5432/...`
+  at runtime. No code change needed.
+- Health check uses the existing `GET /health` endpoint.
+- The `useradd` warning about uid 1001 > SYS_UID_MAX 999 is benign — the
+  user is created correctly and the container runs as `bloom`.
+
+### Verification
+- Image built successfully: `bloom2-backend:phase2` (353MB disk, 80.2MB
+  content).
+- Ran against a throwaway `postgres:17-alpine` container on a shared
+  Docker network with `DATABASE_URL` pointed at `bloom2-pg:5432`:
+  - Pool initialized, both migrations applied, demo data seeded
+    (1 user, 3 practitioners, plan, logs, biomarkers, chat).
+  - `GET /health` → `{"status":"ok","model":"gemini-3.1-flash-live-preview"}`.
+  - Patient login `demo`/`demodemo` → bearer token returned.
+  - Practitioner login `dranya`/`demodemo` → bearer token + profile returned.
+  - Container runs as non-root `bloom` user; `/app/uploads` is writable.
+
+## 12. Frontend (Expo Web) Dockerization (Phase 3 of staging plan)
+
+Containerized the React Native patient app as an Expo web (SPA) build served
+by nginx, so it can be tested in a browser alongside the rest of the stack.
+
+### What was built
+- `frontend/src/config.ts` — rewritten to support build-time `EXPO_PUBLIC_*`
+  env vars while preserving the local-dev defaults:
+  - `EXPO_PUBLIC_BACKEND_ORIGIN` — the proxy origin the browser talks to
+    (e.g. `http://localhost:8080`). Falls back to `localhost:8000` /
+    `10.0.2.2:8000` (Android emulator) when unset.
+  - `EXPO_PUBLIC_API_PREFIX` — the REST API path prefix the proxy strips
+    (e.g. `/api`). When set, `HTTP_BASE = ${ORIGIN}${PREFIX}`; when unset,
+    `HTTP_BASE` is the bare origin (current local-dev behavior).
+  - New export `BACKEND_ORIGIN` — the raw origin used for the voice
+    WebSocket (`WS_BASE`) and the Socket.io chat connection. `WS_BASE` is
+    derived from it by swapping the scheme to `ws://`.
+- `frontend/src/useChatSocket.ts` — Socket.io now connects to
+  `BACKEND_ORIGIN` (not `HTTP_BASE`), since it talks to
+  `/chat-ws/socket.io` directly and must NOT carry the `/api` prefix in
+  the Dockerized build.
+- `frontend/package.json` — added `export:web` script (`expo export -p web`).
+- `frontend/app.json` — added `web.output: "single"` (SPA mode: one
+  `index.html` + hashed assets, no per-route static HTML).
+- `frontend/Dockerfile` — multi-stage build:
+  - **Builder:** `node:20-alpine`, `npm ci` from the lockfile, then
+    `npx expo export -p web`. `EXPO_PUBLIC_BACKEND_ORIGIN` and
+    `EXPO_PUBLIC_API_PREFIX` are `ARG`s (defaulted to
+    `http://localhost:8080` / `/api` for the standard proxy stack) exported
+    as `ENV` so Metro inlines them into the JS bundle at build time.
+  - **Runtime:** `nginx:alpine` serves the static `dist/` with an SPA
+    fallback. Internal-only (port 80 in-container); the Phase 5 reverse
+    proxy routes `/` to it.
+- `frontend/nginx.conf` — SPA serving: long-lived `Cache-Control:
+  immutable` for hashed JS/CSS/image assets, `try_files $uri $uri/
+  /index.html` fallback for client-side routing, gzip on.
+- `frontend/.dockerignore` — excludes `node_modules/`, `.expo/`, `dist/`,
+  native folders, editor/OS noise.
+
+### Design notes
+- Local dev (`./sf`) is unaffected: with no `EXPO_PUBLIC_*` vars set,
+  `config.ts` resolves to the same `http://localhost:8000` /
+  `ws://localhost:8000` it always did. Verified with `tsc --noEmit`.
+- The Socket.io origin split is the key subtlety the staging plan called
+  out: Socket.io connects to `/chat-ws/socket.io` directly on the proxy
+  origin, NOT under `/api`. Using `HTTP_BASE` for it would have produced
+  `http://localhost:8080/api/chat-ws/socket.io` (wrong).
+
+### Verification
+- Image built: `bloom2-frontend:phase3` (95.6MB).
+- `expo export -p web` succeeded in the builder: 662 modules →
+  `dist/index.html` (1.2KB) + 3 JS bundles (1.4MB main, 25KB + 2.8KB
+  audio engines) + 11 assets.
+- Ran the container on port 18080:
+  - `GET /` → 200, serves `index.html` (text/html).
+  - `GET /some/deep/client/route` → 200 (SPA fallback to index.html).
+  - JS asset → 200, 1.4MB, `application/javascript`.
+- Inspected the inlined bundle: `BACKEND_ORIGIN="http://localhost:8080"`,
+  `HTTP_BASE=`${BACKEND_ORIGIN}/api``, `WS_BASE=BACKEND_ORIGIN.replace(/^http/,
+  "ws")` — exactly as designed.
+- `npx tsc --noEmit` passes (local dev config path still type-checks).
+
+## 13. Practitioner (Next.js) Dockerization (Phase 4 of staging plan)
+
+Containerized the Next.js 16 practitioner web app with `output: "standalone"`
+and a `basePath: "/practitioner"` so it is served at `/practitioner/` behind
+the nginx reverse proxy.
+
+### What was built
+- `practitioner/next.config.ts` — set `output: "standalone"` and a
+  build-time `basePath` driven by the `PRACTITIONER_BASE_PATH` env var.
+  When unset (local dev), basePath is `""` and the app is served at `/`
+  as before. Also exposes `NEXT_PUBLIC_BASE_PATH` to client bundles.
+- `practitioner/src/lib/basePath.ts` (new) — `withBasePath()` helper for
+  manual `fetch()` calls in client components. Next.js auto-prefixes
+  `<Link>`, `router.push()`, `redirect()`, and route handler paths with
+  the basePath, but raw `fetch()` calls are NOT auto-prefixed. The helper
+  reads `NEXT_PUBLIC_BASE_PATH` (inlined at build time) and prepends it.
+  In local dev it's a no-op (basePath is `""`).
+- **All client-side `fetch()` calls updated** to use `withBasePath()`:
+  - `src/components/layout/LogoutButton.tsx` — `/api/auth/logout`
+  - `src/components/appointments/AppointmentActions.tsx` — appointment actions
+  - `src/components/patients/PatientPanels.tsx` — AI summary + notes
+  - `src/components/patients/ChatClient.tsx` — AI chat
+  - `src/components/patients/SettingsForm.tsx` — profile update
+  - `src/components/patients/PlanDesignerClient.tsx` — plan publish + design
+  - `src/components/patients/PlanSuggestionsPanel.tsx` — suggestions CRUD
+  - `src/components/patients/MessageThread.tsx` — chat messages + ws-token
+  - `src/app/(auth)/login/page.tsx` — login
+  - `src/app/(auth)/register/page.tsx` — register
+- `practitioner/src/proxy.ts` — auth gate redirect now uses
+  `request.nextUrl.basePath` so unauthenticated users are redirected to
+  `${basePath}/login` (was hardcoded to `/login`). Next.js middleware
+  receives the pathname WITHOUT the basePath (it's stripped before the
+  proxy runs), so the public-route checks are unchanged.
+- `practitioner/.env.example` — documented `PRACTITIONER_BASE_PATH` and
+  the Docker Compose values for `PRACTITIONER_BACKEND_URL` (server-side,
+  Docker internal `http://backend:8000`) and `NEXT_PUBLIC_BACKEND_URL`
+  (client-side Socket.io, proxy origin `http://localhost:8080`).
+- `practitioner/Dockerfile` — three-stage build:
+  - **deps:** `node:20-alpine`, `npm ci --omit=dev` (cached layer).
+  - **builder:** `node:20-alpine`, full `npm ci`, `npm run build` with
+    build-time `ARG`s: `PRACTITIONER_BASE_PATH=/practitioner`,
+    `NEXT_PUBLIC_BACKEND_URL=http://localhost:8080`. Both are exported
+    as `ENV` so Next.js inlines them into the standalone server + client
+    bundles. `NODE_ENV=production`.
+  - **runner:** `node:20-alpine`, copies ONLY `.next/standalone` +
+    `.next/static`. Runs as the non-root `node` user. No `node_modules`
+    in the runtime image (standalone includes a minimal set). Internal-only
+    (port 3000 in-container); the Phase 5 reverse proxy routes
+    `/practitioner/` to it.
+- `practitioner/.dockerignore` — excludes `node_modules/`, `.next/`,
+  `*.tsbuildinfo`, local env files.
+
+### Design notes
+- **Server-side vs client-side env vars:** `PRACTITIONER_BACKEND_URL`
+  (server-side BFF fetches to FastAPI) is a runtime env var set in the
+  Compose service definition — the standalone server reads it at request
+  time. `NEXT_PUBLIC_BACKEND_URL` (client-side Socket.io origin) and
+  `PRACTITIONER_BASE_PATH` (basePath) are build-time — inlined into the
+  JS bundle by Next.js/Metro in the builder stage.
+- **Cookie path stays `/`:** The httpOnly session cookie is set with
+  `path: "/"` so the browser sends it on all requests to the proxy
+  origin, including the BFF route handlers under `${basePath}/api/...`.
+  This works in both local dev (basePath="") and Docker (basePath="/practitioner").
+- **No `<Image>` or `public/` dir:** The app has no `next/image` usage
+  or static public assets, so the Dockerfile doesn't copy a `public/`
+  dir (none exists).
+
+### Verification
+- Image built: `bloom2-practitioner:phase4` (267MB).
+- `next build` succeeded with all 19 routes compiled (Turbopack).
+- Ran the container on port 13000:
+  - `GET /` → 404 (expected — app is at `/practitioner/`, not `/`).
+  - `GET /practitioner` → 307 redirect to `/practitioner/login`
+    (proxy.ts auth gate working with basePath).
+  - `GET /practitioner/login` → 200, full HTML (10.6KB), correct title
+    "Bloom2 — Practitioner".
+  - Static assets at `/practitioner/_next/static/chunks/*.js` → 200,
+    served correctly under the basePath.
+- Inspected the inlined client bundle: `withBasePath` reads
+  `"/practitioner"` (inlined `NEXT_PUBLIC_BASE_PATH`); Next.js router
+  internals also reference `/practitioner` for auto-prefixed Links.
+- Local dev unaffected: `npx tsc --noEmit` passes; `npm run build`
+  without `PRACTITIONER_BASE_PATH` produces routes at `/`, `/login`,
+  etc. as before.
+
+## 14. nginx Reverse Proxy (Phase 5 of staging plan)
+
+Single nginx entry point that routes by path prefix to the
+internal-only services on the Compose network. The browser always talks
+to one origin (the proxy); no other service exposes a host port. This
+eliminates CORS issues and hardcoded URLs.
+
+### What was built
+- `proxy/nginx.conf` — complete nginx config (replaces the default
+  `/etc/nginx/nginx.conf` so we have full control over the `http{}`
+  context for the `map` directive). Routes:
+  - `/api/` → `http://backend:8000/` — **strips** the `/api` prefix
+    (trailing slash on `proxy_pass` tells nginx to strip the location
+    prefix). `/api/health` → backend sees `/health`.
+  - `/ws/` → `http://backend:8000` — voice WebSocket, path passed
+    unchanged (no URI in `proxy_pass`). `proxy_read_timeout 3600s` for
+    long-lived audio sessions.
+  - `/chat-ws/` → `http://backend:8000` — Socket.io, path passed
+    unchanged. `proxy_read_timeout 60s` (must exceed Socket.io's
+    `pingInterval + pingTimeout` = 45s default, or nginx closes idle
+    connections).
+  - `/practitioner` → `http://practitioner:3000` — Next.js app, path
+    passed unchanged (Next.js `basePath: /practitioner` expects the
+    prefix). `/practitioner/login` → practitioner sees
+    `/practitioner/login`.
+  - `/` → `http://frontend:80` — Expo web SPA, catch-all.
+- WebSocket upgrade handling: `map $http_upgrade $connection_upgrade`
+  block at the `http` level (the standard nginx pattern from
+  https://nginx.org/en/docs/http/websocket.html). Each WebSocket
+  location sets `proxy_http_version 1.1` + `Upgrade` + `Connection`
+  headers.
+- `client_max_body_size 50M` — allows large health document uploads
+  (PDFs/images to `/api/upload-doc`); the default 1MB is too small.
+- `proxy/Dockerfile` — `nginx:alpine` + `COPY nginx.conf`. Single layer.
+  Internal-only (port 80 in-container); the Compose service maps the
+  host port (e.g. `8080:80`).
+- `proxy/.dockerignore` — excludes everything except `nginx.conf`.
+
+### Design notes
+- **Prefix stripping vs preservation:** The `/api/` location uses
+  `proxy_pass http://backend:8000/;` (trailing slash = strip prefix).
+  The `/practitioner` and `/ws/` and `/chat-ws/` locations use
+  `proxy_pass http://...:port;` (no URI = pass path unchanged). This
+  distinction is the most common source of proxy misconfiguration —
+  see https://www.getpagespeed.com/server-setup/nginx/nginx-proxy-pass-trailing-slash.
+- **nginx resolves upstream hostnames at startup.** If a service isn't
+  up yet, nginx fails to start. The Compose `depends_on` with health
+  checks (Phase 6) ensures upstreams are ready before the proxy starts.
+- **No `upstream` blocks** — direct `proxy_pass` with hostnames is
+  simpler and sufficient for staging. Docker Compose's internal DNS
+  resolves `backend`, `practitioner`, `frontend` to container IPs.
+- **Logs to stdout/stderr** so `docker compose logs proxy` works.
+
+### Verification
+- Image built: `bloom2-proxy:phase5` (49.2MB).
+- `nginx -t` passes when upstreams are resolvable (on the Compose
+  network).
+- End-to-end routing test with mock upstream containers on a shared
+  Docker network:
+  - `/api/health` → backend received `/health` (prefix stripped ✓)
+  - `/api/dashboard/today` → backend received `/dashboard/today` ✓
+  - `/practitioner/login` → practitioner received `/practitioner/login`
+    (prefix preserved ✓)
+  - `/practitioner/_next/static/chunks/abc.js` → practitioner received
+    full path ✓
+  - `/` → frontend received `/` (catch-all ✓)
+  - `/some/deep/client/route` → frontend received `/some/deep/client/route`
+    (SPA fallback will be handled by the frontend's own nginx ✓)
+  - `/ws/user123/session456` → backend received `/ws/user123/session456`
+    (prefix preserved ✓)
+  - `/chat-ws/socket.io/?EIO=4&transport=polling` → backend received
+    `/chat-ws/socket.io/?EIO=4` (prefix preserved, query params
+    forwarded ✓)
+  - WebSocket upgrade requests on `/ws/` and `/chat-ws/` forwarded to
+    the backend (not rejected by nginx).
+
+## 15. Docker Compose Assembly (Phase 6 of staging plan)
+
+Assembled all 5 services into a single `docker compose up --build` stack
+with health-checked dependency ordering, named volumes for data
+persistence, and a single proxy entry point.
+
+### What was built
+- `docker-compose.yml` (project root) — 5 services:
+  - **postgres** — `postgres:17-alpine`, named volume `pgdata` for data
+    persistence. Health check via `pg_isready`. Internal-only.
+  - **backend** — built from `./backend`, named volume `uploads` for
+    health document persistence. Depends on postgres (service_healthy).
+    Health check via Python `urllib` hitting `/health` (python:3.12-slim
+    has no curl/wget). `start_period: 40s` gives time for pool init +
+    migrations + seeding. Internal-only.
+  - **practitioner** — built from `./practitioner` with build-time args
+    (`PRACTITIONER_BASE_PATH=/practitioner`,
+    `NEXT_PUBLIC_BACKEND_URL=http://localhost:${PROXY_PORT}`). Depends
+    on backend (service_healthy). Runtime env:
+    `PRACTITIONER_BACKEND_URL=http://backend:8000` (Docker internal).
+    Internal-only.
+  - **frontend** — built from `./frontend` with build-time args
+    (`EXPO_PUBLIC_BACKEND_ORIGIN=http://localhost:${PROXY_PORT}`,
+    `EXPO_PUBLIC_API_PREFIX=/api`). No depends_on (static SPA, doesn't
+    need the backend to start). Internal-only.
+  - **proxy** — built from `./proxy`. Depends on backend
+    (service_healthy), practitioner + frontend (service_started). The
+    ONLY host port mapping: `${PROXY_PORT:-8080}:80`.
+- `.env.docker.example` — 3 variables:
+  - `GOOGLE_API_KEY` (required) — Gemini API key.
+  - `POSTGRES_PASSWORD` (default `bloom`) — PostgreSQL password.
+  - `PROXY_PORT` (default `8080`) — host port for the nginx proxy.
+    Configurable in case 8080 is taken (e.g. by another service on the
+    dev machine). Since this is a build-time arg for the frontend and
+    practitioner images, changing it requires a rebuild.
+- `.gitignore` — added `.env.docker` (the actual env file with secrets).
+
+### Design notes
+- **`--env-file` flag:** Docker Compose's `${}` interpolation reads from
+  the shell environment or the `.env` file at the project root by
+  default. Since we use `.env.docker` (to keep Docker secrets separate
+  from local dev `.env` files), the user must pass
+  `--env-file .env.docker`:
+  ```
+  docker compose --env-file .env.docker up --build
+  ```
+  This makes `GOOGLE_API_KEY`, `POSTGRES_PASSWORD`, and `PROXY_PORT`
+  available for interpolation in the compose file.
+- **Required vs optional vars:** `GOOGLE_API_KEY` uses
+  `${GOOGLE_API_KEY:?message}` — the `:?` guard causes Docker Compose
+  to fail with a clear error if the var is unset (rather than silently
+  using an empty string). `POSTGRES_PASSWORD` and `PROXY_PORT` use
+  `:-default` so the stack works with sensible defaults even without
+  the env file.
+- **Health-checked dependency chain:**
+  postgres (healthy) → backend (healthy) → practitioner + proxy.
+  The proxy also depends on frontend (service_started) because nginx
+  resolves upstream hostnames at startup — if frontend isn't up, nginx
+  fails to start.
+- **Backend health check uses Python urllib** (not curl/wget) because
+  `python:3.12-slim` doesn't include either. The check hits
+  `http://localhost:8000/health` from inside the container.
+- **`PROXY_PORT` is a build-time arg** for frontend and practitioner
+  (it's inlined into the JS bundle as `EXPO_PUBLIC_BACKEND_ORIGIN` /
+  `NEXT_PUBLIC_BACKEND_URL`). Changing it requires rebuilding those
+  images — `docker compose up --build` handles this automatically.
+- **No `env_file:` directive** — all env vars are set via `environment:`
+  blocks with `${}` interpolation from the `--env-file`. This keeps the
+  source of truth in one place (the `.env.docker` file) and avoids the
+  mismatch problem where `env_file` loads a var into a container but
+  `${}` interpolation can't see it.
+
+### Verification
+- `docker compose --env-file .env.docker config` passes (valid YAML,
+  correct interpolation).
+- All 4 images built successfully (backend, frontend, practitioner,
+  proxy).
+- Full stack brought up with correct dependency ordering:
+  postgres → (healthy) → backend → (healthy) → practitioner + proxy.
+- All routes through the proxy verified:
+  - `GET /api/health` → 200 `{"status":"ok","model":"gemini-3.1-flash-live-preview"}`
+  - `GET /` → 200 (Expo web SPA, 1210 bytes)
+  - `GET /some/deep/route` → 200 (SPA fallback)
+  - `GET /practitioner` → 307 redirect to `/practitioner/login`
+  - `GET /practitioner/login` → 200 (10.6KB HTML)
+- Auth flows verified:
+  - Patient login `demo`/`demodemo` via `POST /api/auth/login` → token returned.
+  - Practitioner BFF login `dranya`/`demodemo` via `POST /practitioner/api/auth/login` → practitioner data + httpOnly cookie set.
+  - Practitioner appointments via BFF proxy `GET /practitioner/api/proxy/practitioner/appointments` (with cookie) → 200 with appointment data.
+- Dashboard data verified: onboarded=True, day 14 of plan, 8 schedule items, 10 biomarkers.
+- **Data persistence verified:** `docker compose down` + `up` (without
+  `-v`) — demo user, dashboard data, and all seeded data survived via
+  the `pgdata` named volume. Seeder correctly skipped re-seeding
+  ("demo user already onboarded — skipping").
+- Frontend bundle verified to have `localhost:${PROXY_PORT}` correctly
+  inlined as `EXPO_PUBLIC_BACKEND_ORIGIN`.
+- Named volumes created: `bloom2app_pgdata`, `bloom2app_uploads`.

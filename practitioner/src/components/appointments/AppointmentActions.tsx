@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import type { Appointment } from "@/lib/types";
+import { withBasePath } from "@/lib/basePath";
 
 export function AppointmentActions({ appointment }: { appointment: Appointment }) {
   const router = useRouter();
@@ -13,7 +14,7 @@ export function AppointmentActions({ appointment }: { appointment: Appointment }
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`/api/proxy/practitioner/appointments/${appointment.id}/${action}`, {
+      const res = await fetch(withBasePath(`/api/proxy/practitioner/appointments/${appointment.id}/${action}`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),

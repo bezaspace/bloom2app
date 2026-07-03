@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { Send, ArrowLeft } from "lucide-react";
 import { PUBLIC_BACKEND_URL } from "@/lib/env";
+import { withBasePath } from "@/lib/basePath";
 import type { ChatMessage } from "@/lib/types";
 
 interface MessageThreadProps {
@@ -42,7 +43,7 @@ export function MessageThread({
     setLoading(true);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/messages?limit=50`,
+        withBasePath(`/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/messages?limit=50`),
       );
       if (!res.ok) throw new Error("Failed to load messages");
       const data = await res.json();
@@ -50,7 +51,7 @@ export function MessageThread({
       setHasMore(data.has_more);
       // Mark as read on open.
       await fetch(
-        `/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/read`,
+        withBasePath(`/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/read`),
         { method: "POST" },
       );
     } catch (e) {
@@ -73,7 +74,7 @@ export function MessageThread({
       // Mint a short-lived WS token via the BFF.
       let wsToken: string;
       try {
-        const res = await fetch("/api/auth/ws-token", { method: "POST" });
+        const res = await fetch(withBasePath("/api/auth/ws-token"), { method: "POST" });
         if (!res.ok) throw new Error("Failed to get WS token");
         const data = await res.json();
         wsToken = data.token;
@@ -126,7 +127,7 @@ export function MessageThread({
       // If from patient, mark read.
       if (msg.sender === "patient") {
         void fetch(
-          `/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/read`,
+          withBasePath(`/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/read`),
           { method: "POST" },
         );
         sock.emit("message_read", {
@@ -190,7 +191,7 @@ export function MessageThread({
     try {
       const oldestId = messages[0].id;
       const res = await fetch(
-        `/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/messages?before=${oldestId}&limit=50`,
+        withBasePath(`/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/messages?before=${oldestId}&limit=50`),
       );
       if (!res.ok) throw new Error("Failed to load older messages");
       const data = await res.json();
@@ -243,7 +244,7 @@ export function MessageThread({
       });
       // REST fallback to ensure persistence + get the real id.
       const res = await fetch(
-        `/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/messages`,
+        withBasePath(`/api/proxy/practitioner/chat/conversations/${encodeURIComponent(username)}/messages`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

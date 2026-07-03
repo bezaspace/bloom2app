@@ -3,6 +3,7 @@
 import { useState, useCallback } from "react";
 import { Sparkles, Check, X, RefreshCw, Plus } from "lucide-react";
 import type { PlanSuggestion } from "@/lib/types";
+import { withBasePath } from "@/lib/basePath";
 
 interface PlanSuggestionsPanelProps {
   username: string;
@@ -21,7 +22,7 @@ export function PlanSuggestionsPanel({
   const refresh = useCallback(async () => {
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/suggestions`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/suggestions`),
       );
       if (!res.ok) throw new Error("Failed to fetch suggestions");
       const data = await res.json();
@@ -36,7 +37,7 @@ export function PlanSuggestionsPanel({
     setError(null);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/suggestions/generate`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/suggestions/generate`),
         { method: "POST" },
       );
       if (!res.ok) {
@@ -58,7 +59,7 @@ export function PlanSuggestionsPanel({
     setError(null);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/suggestions/${id}/decide`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/suggestions/${id}/decide`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Practitioner } from "@/lib/types";
+import { withBasePath } from "@/lib/basePath";
 
 export function SettingsForm({ practitioner }: { practitioner: Practitioner }) {
   const router = useRouter();
@@ -46,7 +47,7 @@ export function SettingsForm({ practitioner }: { practitioner: Practitioner }) {
         return;
       }
 
-      const res = await fetch("/api/proxy/practitioner/auth/profile", {
+      const res = await fetch(withBasePath("/api/proxy/practitioner/auth/profile"), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

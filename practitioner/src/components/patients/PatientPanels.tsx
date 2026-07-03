@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Sparkles, MessageSquare, Plus, ClipboardList, BarChart3, MessagesSquare } from "lucide-react";
 import type { AISummary, PractitionerNote } from "@/lib/types";
+import { withBasePath } from "@/lib/basePath";
 
 // ---------------------------------------------------------------------------
 // AI Summary card
@@ -20,7 +21,7 @@ export function AISummaryCard({ username }: { username: string }) {
     setError(null);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/ai-summary`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/ai-summary`),
         { method: "POST" },
       );
       if (!res.ok) {
@@ -97,7 +98,7 @@ export function NotesPanel({
     setError(null);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/notes`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/notes`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -1,0 +1,4 @@
+# Keep the build context lean — only the Dockerfile and nginx.conf are needed.
+Dockerfile
+.dockerignore
+*.md

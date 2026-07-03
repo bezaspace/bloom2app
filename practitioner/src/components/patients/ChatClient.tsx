@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { Send } from "lucide-react";
+import { withBasePath } from "@/lib/basePath";
 
 interface Message {
   role: "user" | "assistant";
@@ -26,7 +27,7 @@ export function ChatClient({ username }: { username: string }) {
     setBusy(true);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/ai-chat`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/ai-chat`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

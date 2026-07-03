@@ -1,0 +1,29 @@
+# Local dependencies — installed fresh inside the builder
+node_modules/
+
+# Next.js build output / cache
+.next/
+out/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Local env files
+.env*.local
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Logs
+npm-debug.*
+yarn-debug.*
+yarn-error.*

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { withBasePath } from "@/lib/basePath";
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -42,7 +43,7 @@ export default function RegisterPage() {
       if (form.years_experience) payload.years_experience = Number(form.years_experience);
       if (form.consultation_fee) payload.consultation_fee = Number(form.consultation_fee);
 
-      const res = await fetch("/api/auth/register", {
+      const res = await fetch(withBasePath("/api/auth/register"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

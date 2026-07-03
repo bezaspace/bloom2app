@@ -1,0 +1,35 @@
+# Local dependencies — installed fresh inside the builder
+node_modules/
+
+# Expo build artifacts / caches
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+.metro-health-check*
+
+# Native generated folders (not used by the web build)
+ios/
+android/
+.kotlin/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.pem
+
+# Local env files
+.env*.local
+
+# Git
+.git/
+.gitignore
+
+# Logs
+npm-debug.*
+yarn-debug.*
+yarn-error.*

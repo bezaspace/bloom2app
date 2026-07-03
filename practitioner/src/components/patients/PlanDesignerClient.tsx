@@ -10,6 +10,7 @@ import type {
   MetricTemplate,
   DesignAgentResponse,
 } from "@/lib/types";
+import { withBasePath } from "@/lib/basePath";
 
 interface PlanDesignerClientProps {
   username: string;
@@ -40,7 +41,7 @@ export function PlanDesignerClient({
     setPublishMsg(null);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/publish`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/publish`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -267,7 +268,7 @@ function AIChatTab({
     setBusy(true);
     try {
       const res = await fetch(
-        `/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/design`,
+        withBasePath(`/api/proxy/practitioner/patients/${encodeURIComponent(username)}/plan/design`),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { getToken } from "./auth";
-import { HTTP_BASE, WS_BASE } from "./config";
+import { BACKEND_ORIGIN } from "./config";
 import type { ChatMessage } from "./chat";
 
 /**
@@ -40,8 +40,10 @@ export function useChatSocket() {
       }
 
       // Connect to the Socket.io server. The path matches the backend mount.
-      // Use the HTTP origin (the socket.io client upgrades to ws internally).
-      const origin = HTTP_BASE; // http://host:port
+      // Use the proxy/backend ORIGIN (not HTTP_BASE, which may carry an /api
+      // prefix in the Dockerized web build) — Socket.io connects to
+      // /chat-ws/socket.io directly, not under /api.
+      const origin = BACKEND_ORIGIN;
       sock = io(origin, {
         path: "/chat-ws/socket.io",
         auth: { token },

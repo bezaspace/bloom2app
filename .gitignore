@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+.env.docker
 
 # Auth database
 auth.db

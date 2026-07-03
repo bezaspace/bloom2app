@@ -5,10 +5,11 @@ import { COOKIE_NAME } from "@/lib/env";
  * from /(app)/* routes to /login. Authorization itself stays on the
  * backend — every BFF call re-verifies the token. */
 export function proxy(request: NextRequest): NextResponse {
-  const { pathname } = request.nextUrl;
+  const { pathname, basePath } = request.nextUrl;
   const token = request.cookies.get(COOKIE_NAME)?.value;
 
-  // Public routes that don't require auth.
+  // Public routes that don't require auth. (pathname is the raw path
+  // WITHOUT the basePath — Next.js strips it before middleware runs.)
   const isPublic =
     pathname === "/login" ||
     pathname === "/register" ||
@@ -19,7 +20,9 @@ export function proxy(request: NextRequest): NextResponse {
   }
 
   if (!token) {
-    const loginUrl = new URL("/login", request.url);
+    // Build the redirect URL with the basePath so the browser lands on
+    // the correct login page behind the reverse proxy.
+    const loginUrl = new URL(`${basePath}/login`, request.url);
     return NextResponse.redirect(loginUrl);
   }
 

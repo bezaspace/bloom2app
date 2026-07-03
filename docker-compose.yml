@@ -1,0 +1,180 @@
+# Bloom2 local staging stack — Docker Compose.
+#
+# Brings up the entire platform with a single `docker compose up --build`:
+#   postgres     — PostgreSQL 17 (data persisted in a named volume)
+#   backend      — FastAPI + ADK + Gemini Live API (internal-only)
+#   practitioner — Next.js 16 standalone (internal-only, served at /practitioner/)
+#   frontend     — Expo web SPA served by nginx (internal-only)
+#   proxy        — nginx reverse proxy, the single entry point (default :8080)
+#
+# Only the proxy exposes a host port. All other services are internal-only
+# on the Compose network. The browser always talks to one origin
+# (http://localhost:<PROXY_PORT>, default 8080), eliminating CORS issues
+# and hardcoded URLs.
+#
+# ── Usage ──────────────────────────────────────────────────────────────
+#
+#   cp .env.docker.example .env.docker
+#   # edit .env.docker — set GOOGLE_API_KEY (required)
+#   # optionally set PROXY_PORT if 8080 is taken on your machine
+#   docker compose --env-file .env.docker up --build
+#
+# The --env-file flag makes GOOGLE_API_KEY, POSTGRES_PASSWORD, and
+# PROXY_PORT available for ${} interpolation below. Without it,
+# GOOGLE_API_KEY will be unset and the backend will fail to start (the :?
+# guard below gives a clear error). POSTGRES_PASSWORD defaults to "bloom"
+# and PROXY_PORT defaults to 8080 if not set.
+#
+# NOTE: PROXY_PORT is a build-time arg for the frontend and practitioner
+# (it's inlined into the JS bundle). Changing it requires a rebuild:
+#   docker compose --env-file .env.docker up --build
+#
+# ── Verification ───────────────────────────────────────────────────────
+#
+#   http://localhost:<PROXY_PORT>/              → patient app (Expo web)
+#   http://localhost:<PROXY_PORT>/practitioner/ → practitioner app
+#   http://localhost:<PROXY_PORT>/api/health    → backend health check
+#
+# Demo logins (auto-seeded on first start):
+#   patient:      demo / demodemo
+#   practitioner: dranya / demodemo
+#
+# ── Teardown ───────────────────────────────────────────────────────────
+#
+#   docker compose down          — stop + remove containers (volumes persist)
+#   docker compose down -v       — also wipe the postgres data volume
+
+services:
+  # ─────────────────────────────────────────────────────────────────────
+  # PostgreSQL
+  # ─────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bloom
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bloom}
+      POSTGRES_DB: bloom2
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bloom -d bloom2"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    # Internal-only — no host port mapping.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Backend (FastAPI + ADK + Gemini Live API)
+  # ─────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    image: bloom2-backend:staging
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Required: Gemini API key (interpolated from .env.docker via --env-file).
+      # The :? guard gives a clear error if the user forgot to set it.
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:?Set GOOGLE_API_KEY in .env.docker (see .env.docker.example)}
+      # Use Google AI Studio (API key) instead of Vertex AI.
+      GOOGLE_GENAI_USE_ENTERPRISE: "FALSE"
+      # Live API model (native audio).
+      AGENT_MODEL: gemini-3.1-flash-live-preview
+      # PostgreSQL — Docker internal hostname "postgres", password from env.
+      DATABASE_URL: postgresql://bloom:${POSTGRES_PASSWORD:-bloom}@postgres:5432/bloom2
+      # Auto-seed demo data on first startup (when DB is empty).
+      SEED_ON_STARTUP: "true"
+      # Server config (also set in the Dockerfile, repeated for clarity).
+      HOST: "0.0.0.0"
+      PORT: "8000"
+    volumes:
+      # Persist uploaded health documents across container restarts.
+      - uploads:/app/uploads
+    healthcheck:
+      # python:3.12-slim has no curl/wget — use Python's urllib.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Give the backend time to init the pool, run migrations, and seed
+      # before the health check starts counting failures.
+      start_period: 40s
+    # Internal-only — no host port mapping.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Practitioner (Next.js 16 standalone)
+  # ─────────────────────────────────────────────────────────────────────
+  practitioner:
+    build:
+      context: ./practitioner
+      args:
+        # Build-time args (inlined into the JS bundle by Next.js/Metro).
+        # These match the Dockerfile defaults — repeated here for clarity
+        # and to make the compose file self-documenting.
+        PRACTITIONER_BASE_PATH: /practitioner
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:${PROXY_PORT:-8080}
+    image: bloom2-practitioner:staging
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Server-side BFF URL — Docker internal hostname (browser can't
+      # resolve this, but the Next.js server can).
+      PRACTITIONER_BACKEND_URL: http://backend:8000
+      PRACTITIONER_COOKIE_NAME: practitioner_session
+      # NEXT_PUBLIC_BACKEND_URL and PRACTITIONER_BASE_PATH are build-time
+      # only (inlined into the client bundle) — not needed at runtime.
+    # Internal-only — no host port mapping.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Frontend (Expo web SPA)
+  # ─────────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Build-time args (inlined into the JS bundle by Metro).
+        # These match the Dockerfile defaults — repeated here for clarity.
+        EXPO_PUBLIC_BACKEND_ORIGIN: http://localhost:${PROXY_PORT:-8080}
+        EXPO_PUBLIC_API_PREFIX: /api
+    image: bloom2-frontend:staging
+    restart: unless-stopped
+    # No depends_on — the frontend is a static SPA served by its own nginx.
+    # It doesn't need the backend to start, and the proxy handles routing.
+    # Internal-only — no host port mapping.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # nginx reverse proxy — the single entry point
+  # ─────────────────────────────────────────────────────────────────────
+  proxy:
+    build:
+      context: ./proxy
+    image: bloom2-proxy:staging
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      practitioner:
+        condition: service_started
+      frontend:
+        condition: service_started
+    ports:
+      # The ONLY host port mapping in the stack.
+      # The browser talks to http://localhost:<PROXY_PORT> for everything.
+      - "${PROXY_PORT:-8080}:80"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Named volumes — data persists across `docker compose down` + `up`
+# ─────────────────────────────────────────────────────────────────────────
+volumes:
+  pgdata:
+    # PostgreSQL data directory — survives container recreation.
+    # Use `docker compose down -v` to wipe.
+  uploads:
+    # Uploaded health documents (PDFs/images) — survives container
+    # recreation so users don't lose their uploaded labs.
